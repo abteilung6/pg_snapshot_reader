@@ -1,4 +1,10 @@
-use tokio_postgres::{NoTls, Error};
+use tokio_postgres::{Error, NoTls};
+
+struct User {
+    id: i32,
+    name: String,
+    email: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -14,17 +20,36 @@ async fn main() -> Result<(), Error> {
         }
     });
 
+    let users = read_users(&client).await?;
+
+    for user in users {
+        println!(
+            "id={}, name={}, email={}",
+            user.id,
+            user.name,
+            user.email
+        );
+    }
+
+    Ok(())
+}
+
+async fn read_users(
+    client: &tokio_postgres::Client
+) -> Result<Vec<User>, Error> {
     let rows = client
         .query("SELECT id, name, email FROM users", &[])
         .await?;
 
-    for row in rows {
-        let id: i32 = row.get("id");
-        let name: String = row.get("name");
-        let email: String = row.get("email");
+    let mut users = Vec::new();
 
-        println!("id={}, name={}, email={}", id, name, email);
+    for row in rows {
+        users.push(User {
+            id: row.get("id"),
+            name: row.get("name"),
+            email: row.get("email"),
+        });
     }
 
-    Ok(())
+    Ok(users)
 }
