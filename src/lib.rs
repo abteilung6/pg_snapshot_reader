@@ -33,6 +33,15 @@ pub struct SnapshotRow {
     pub values: HashMap<String, SnapshotValue>,
 }
 
+impl TableSchema {
+    pub fn primary_key_column(&self) -> &Column {
+        self.columns
+            .iter()
+            .find(|column| column.is_primary_key)
+            .expect("expected table to have a primary key")
+    }
+}
+
 pub async fn read_users_batch(
     client: &Client,
     table_name: &str,
@@ -222,9 +231,11 @@ pub async fn read_snapshot_rows_full(
 
         let last_row = batch.last().unwrap();
 
-        let last_id = match last_row.values.get("id") {
+        let primary_key = schema.primary_key_column();
+
+        let last_id = match last_row.values.get(&primary_key.name) {
             Some(SnapshotValue::String(value)) => value.parse::<i32>().unwrap(),
-            _ => panic!("expected id column to exist and be a string"),
+            _ => panic!("expected primary key column to exist and be a string"),
         };
 
         last_seen_id = last_id;
@@ -243,15 +254,17 @@ pub fn build_select_query(schema: &TableSchema) -> String {
         .collect::<Vec<String>>()
         .join(", ");
 
+    let primary_key = schema.primary_key_column();
+
     format!(
         "
         SELECT {}
         FROM {}
-        WHERE id > $1
-        ORDER BY id
+        WHERE {} > $1
+        ORDER BY {}
         LIMIT $2
         ",
-        column_names, schema.table_name
+        column_names, schema.table_name, primary_key.name, primary_key.name
     )
 }
 
@@ -262,22 +275,16 @@ mod tests {
     #[test]
     fn builds_select_query_from_schema() {
         let schema = TableSchema {
-            table_name: "users".to_string(),
+            table_name: "posts".to_string(),
             columns: vec![
                 Column {
-                    name: "id".to_string(),
+                    name: "post_id".to_string(),
                     postgres_type: "integer".to_string(),
                     is_nullable: false,
                     is_primary_key: true,
                 },
                 Column {
-                    name: "name".to_string(),
-                    postgres_type: "text".to_string(),
-                    is_nullable: false,
-                    is_primary_key: false,
-                },
-                Column {
-                    name: "email".to_string(),
+                    name: "title".to_string(),
                     postgres_type: "text".to_string(),
                     is_nullable: false,
                     is_primary_key: false,
@@ -287,9 +294,10 @@ mod tests {
 
         let query = build_select_query(&schema);
 
-        assert!(query.contains("SELECT id, name, email"));
-        assert!(query.contains("FROM users"));
-        assert!(query.contains("WHERE id > $1"));
+        assert!(query.contains("SELECT post_id, title"));
+        assert!(query.contains("FROM posts"));
+        assert!(query.contains("WHERE post_id > $1"));
+        assert!(query.contains("ORDER BY post_id"));
         assert!(query.contains("LIMIT $2"));
     }
 }

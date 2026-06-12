@@ -286,6 +286,57 @@ async fn reads_generic_snapshot_rows_batch() -> Result<(), Error> {
 }
 
 #[tokio::test]
+async fn reads_generic_full_snapshot_with_non_id_primary_key() -> Result<(), Error> {
+    let client = connect_to_postgres().await?;
+    let table_name = unique_table_name();
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            post_id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_table_sql, &[]).await?;
+
+    let insert_sql = format!(
+        "
+        INSERT INTO {} (title)
+        VALUES
+            ('First post'),
+            ('Second post'),
+            ('Third post')
+        ",
+        table_name
+    );
+
+    client.execute(&insert_sql, &[]).await?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+    let rows = read_snapshot_rows_full(&client, &schema, 2).await?;
+
+    assert_eq!(rows.len(), 3);
+
+    assert_eq!(
+        rows[0].values.get("post_id"),
+        Some(&SnapshotValue::String("1".to_string()))
+    );
+
+    assert_eq!(
+        rows[2].values.get("title"),
+        Some(&SnapshotValue::String("Third post".to_string()))
+    );
+
+    let drop_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_sql, &[]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn reads_generic_snapshot_rows_from_schema() -> Result<(), Error> {
     let client = connect_to_postgres().await?;
     let table_name = unique_table_name();
