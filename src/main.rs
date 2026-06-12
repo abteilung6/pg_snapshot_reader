@@ -1,6 +1,6 @@
 use tokio_postgres::{Error, NoTls};
 
-use pg_snapshot_reader::{discover_table_schema, read_snapshot_rows_batch};
+use pg_snapshot_reader::{discover_table_schema, read_snapshot_rows_full};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -19,7 +19,7 @@ async fn main() -> Result<(), Error> {
 
     println!("{:#?}", schema);
 
-    let rows = read_snapshot_rows_batch(&client, &schema, 0, 10).await?;
+    let rows = read_snapshot_rows_full(&client, &schema, 2).await?;
 
     for row in rows {
         println!("{:#?}", row);

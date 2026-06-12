@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pg_snapshot_reader::{
     SnapshotValue, discover_table_schema, read_full_snapshot, read_snapshot_rows_batch,
-    read_users_batch,
+    read_snapshot_rows_full, read_users_batch,
 };
 use tokio_postgres::{Client, Error, NoTls};
 
@@ -128,6 +128,55 @@ async fn reads_full_snapshot_in_batches() -> Result<(), Error> {
     assert_eq!(users[0].name, "Alice");
     assert_eq!(users[1].name, "Bob");
     assert_eq!(users[2].name, "Charlie");
+
+    let drop_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_sql, &[]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn reads_generic_full_snapshot_in_batches() -> Result<(), Error> {
+    let client = connect_to_postgres().await?;
+    let table_name = unique_table_name();
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            views INTEGER NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_table_sql, &[]).await?;
+
+    let insert_sql = format!(
+        "
+        INSERT INTO {} (title, views)
+        VALUES
+            ('First post', 10),
+            ('Second post', 20),
+            ('Third post', NULL)
+        ",
+        table_name
+    );
+
+    client.execute(&insert_sql, &[]).await?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+    let rows = read_snapshot_rows_full(&client, &schema, 2).await?;
+
+    assert_eq!(rows.len(), 3);
+
+    assert_eq!(
+        rows[0].values.get("title"),
+        Some(&SnapshotValue::String("First post".to_string()))
+    );
+
+    assert_eq!(rows[2].values.get("views"), Some(&SnapshotValue::Null));
 
     let drop_sql = format!("DROP TABLE {}", table_name);
     client.execute(&drop_sql, &[]).await?;

@@ -205,6 +205,36 @@ pub async fn read_snapshot_rows_batch(
     Ok(snapshot_rows)
 }
 
+pub async fn read_snapshot_rows_full(
+    client: &Client,
+    schema: &TableSchema,
+    batch_size: i64,
+) -> Result<Vec<SnapshotRow>, Error> {
+    let mut all_rows = Vec::new();
+    let mut last_seen_id = 0;
+
+    loop {
+        let batch = read_snapshot_rows_batch(client, schema, last_seen_id, batch_size).await?;
+
+        if batch.is_empty() {
+            break;
+        }
+
+        let last_row = batch.last().unwrap();
+
+        let last_id = match last_row.values.get("id") {
+            Some(SnapshotValue::String(value)) => value.parse::<i32>().unwrap(),
+            _ => panic!("expected id column to exist and be a string"),
+        };
+
+        last_seen_id = last_id;
+
+        all_rows.extend(batch);
+    }
+
+    Ok(all_rows)
+}
+
 pub fn build_select_query(schema: &TableSchema) -> String {
     let column_names = schema
         .columns
