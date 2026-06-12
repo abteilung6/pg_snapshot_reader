@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use tokio_postgres::{Client, Error};
 
 #[derive(Debug, PartialEq)]
@@ -30,7 +31,7 @@ pub enum SnapshotValue {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotRow {
-    pub values: Vec<(String, SnapshotValue)>,
+    pub values: HashMap<String, SnapshotValue>,
 }
 
 pub async fn read_users_batch(
@@ -169,13 +170,13 @@ pub async fn read_snapshot_rows_batch(
     let mut snapshot_rows = Vec::new();
 
     for row in rows {
-        let snapshot_row = SnapshotRow {
-            values: vec![
-                ("id".to_string(), SnapshotValue::Int(row.get("id"))),
-                ("name".to_string(), SnapshotValue::Text(row.get("name"))),
-                ("email".to_string(), SnapshotValue::Text(row.get("email"))),
-            ],
-        };
+        let mut values = HashMap::new();
+
+        values.insert("id".to_string(), SnapshotValue::Int(row.get("id")));
+        values.insert("name".to_string(), SnapshotValue::Text(row.get("name")));
+        values.insert("email".to_string(), SnapshotValue::Text(row.get("email")));
+
+        let snapshot_row = SnapshotRow { values };
 
         snapshot_rows.push(snapshot_row);
     }
