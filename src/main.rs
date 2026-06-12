@@ -1,6 +1,6 @@
 use tokio_postgres::{Error, NoTls};
 
-use pg_snapshot_reader::read_users;
+use pg_snapshot_reader::read_users_from_table;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -16,7 +16,7 @@ async fn main() -> Result<(), Error> {
         }
     });
 
-    let users = read_users(&client).await?;
+    let users = read_users_from_table(&client, "users").await?;
 
     for user in users {
         println!(

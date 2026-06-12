@@ -7,10 +7,16 @@ pub struct User {
     pub email: String,
 }
 
-pub async fn read_users(client: &Client) -> Result<Vec<User>, Error> {
-    let rows = client
-        .query("SELECT id, name, email FROM users", &[])
-        .await?;
+pub async fn read_users_from_table(
+    client: &Client,
+    table_name: &str,
+) -> Result<Vec<User>, Error> {
+    let query = format!(
+        "SELECT id, name, email FROM {} ORDER BY id",
+        table_name
+    );
+
+    let rows = client.query(&query, &[]).await?;
 
     let mut users = Vec::new();
 
