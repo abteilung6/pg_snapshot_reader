@@ -7,6 +7,20 @@ pub struct User {
     pub email: String,
 }
 
+#[derive(Debug, PartialEq)]
+pub struct Column {
+    pub name: String,
+    pub postgres_type: String,
+    pub is_nullable: bool,
+    pub is_primary_key: bool,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct TableSchema {
+    pub table_name: String,
+    pub columns: Vec<Column>,
+}
+
 pub async fn read_users_batch(
     client: &Client,
     table_name: &str,
@@ -60,4 +74,63 @@ pub async fn read_full_snapshot(
     }
 
     Ok(all_users)
+}
+
+pub async fn discover_table_schema(
+    client: &Client,
+    table_name: &str,
+) -> Result<TableSchema, Error> {
+    let columns_query = "
+        SELECT
+            column_name,
+            data_type,
+            is_nullable
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = $1
+        ORDER BY ordinal_position
+    ";
+
+    let pk_query = "
+        SELECT
+            kcu.column_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+          ON tc.constraint_name = kcu.constraint_name
+         AND tc.table_schema = kcu.table_schema
+        WHERE tc.constraint_type = 'PRIMARY KEY'
+          AND tc.table_schema = 'public'
+          AND tc.table_name = $1
+    ";
+
+    let pk_rows = client.query(pk_query, &[&table_name]).await?;
+
+    let primary_keys: Vec<String> = pk_rows
+        .into_iter()
+        .map(|row| row.get("column_name"))
+        .collect();
+
+    let column_rows = client.query(columns_query, &[&table_name]).await?;
+
+    let mut columns = Vec::new();
+
+    for row in column_rows {
+        let name: String = row.get("column_name");
+        let postgres_type: String = row.get("data_type");
+        let is_nullable_string: String = row.get("is_nullable");
+
+        let is_primary_key = primary_keys.contains(&name);
+
+        columns.push(Column {
+            name,
+            postgres_type,
+            is_nullable: is_nullable_string == "YES",
+            is_primary_key,
+        });
+    }
+
+    Ok(TableSchema {
+        table_name: table_name.to_string(),
+        columns,
+    })
 }

@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pg_snapshot_reader::{read_full_snapshot, read_users_batch};
+use pg_snapshot_reader::{discover_table_schema, read_full_snapshot, read_users_batch};
 use tokio_postgres::{Client, Error, NoTls};
 
 fn unique_table_name() -> String {
@@ -120,6 +120,51 @@ async fn reads_full_snapshot_in_batches() -> Result<(), Error> {
     assert_eq!(users[0].name, "Alice");
     assert_eq!(users[1].name, "Bob");
     assert_eq!(users[2].name, "Charlie");
+
+    let drop_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_sql, &[]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovers_table_schema() -> Result<(), Error> {
+    let client = connect_to_postgres().await?;
+    let table_name = unique_table_name();
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            age INTEGER NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_table_sql, &[]).await?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+
+    assert_eq!(schema.table_name, table_name);
+    assert_eq!(schema.columns.len(), 4);
+
+    assert_eq!(schema.columns[0].name, "id");
+    assert_eq!(schema.columns[0].postgres_type, "integer");
+    assert_eq!(schema.columns[0].is_nullable, false);
+    assert_eq!(schema.columns[0].is_primary_key, true);
+
+    assert_eq!(schema.columns[1].name, "name");
+    assert_eq!(schema.columns[1].postgres_type, "text");
+    assert_eq!(schema.columns[1].is_nullable, false);
+    assert_eq!(schema.columns[1].is_primary_key, false);
+
+    assert_eq!(schema.columns[3].name, "age");
+    assert_eq!(schema.columns[3].postgres_type, "integer");
+    assert_eq!(schema.columns[3].is_nullable, true);
+    assert_eq!(schema.columns[3].is_primary_key, false);
 
     let drop_sql = format!("DROP TABLE {}", table_name);
     client.execute(&drop_sql, &[]).await?;

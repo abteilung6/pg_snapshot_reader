@@ -1,6 +1,6 @@
 use tokio_postgres::{Error, NoTls};
 
-use pg_snapshot_reader::read_full_snapshot;
+use pg_snapshot_reader::{discover_table_schema, read_full_snapshot};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -14,6 +14,10 @@ async fn main() -> Result<(), Error> {
             eprintln!("connection error: {}", e);
         }
     });
+
+    let schema = discover_table_schema(&client, "users").await?;
+
+    println!("{:#?}", schema);
 
     let users = read_full_snapshot(&client, "users", 2).await?;
 
