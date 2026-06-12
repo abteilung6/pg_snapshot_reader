@@ -247,6 +247,69 @@ pub async fn read_snapshot_rows_full(
     Ok(all_rows)
 }
 
+pub async fn read_snapshot_rows_full_with_checkpoint(
+    client: &Client,
+    schema: &TableSchema,
+    batch_size: i64,
+    checkpoint_path: &Path,
+) -> anyhow::Result<Vec<SnapshotRow>> {
+    let primary_key = schema.primary_key_column();
+
+    let checkpoint = load_snapshot_checkpoint(checkpoint_path)?;
+
+    let mut last_seen_id = match checkpoint {
+        Some(checkpoint) => {
+            if checkpoint.table_name != schema.table_name {
+                panic!(
+                    "checkpoint table '{}' does not match schema table '{}'",
+                    checkpoint.table_name, schema.table_name
+                );
+            }
+
+            if checkpoint.primary_key_column != primary_key.name {
+                panic!(
+                    "checkpoint primary key '{}' does not match schema primary key '{}'",
+                    checkpoint.primary_key_column, primary_key.name
+                );
+            }
+
+            checkpoint.last_seen_primary_key.parse::<i32>()?
+        }
+        None => 0,
+    };
+
+    let mut all_rows = Vec::new();
+
+    loop {
+        let batch = read_snapshot_rows_batch(client, schema, last_seen_id, batch_size).await?;
+
+        if batch.is_empty() {
+            break;
+        }
+
+        let last_row = batch.last().unwrap();
+
+        let last_id = match last_row.values.get(&primary_key.name) {
+            Some(SnapshotValue::String(value)) => value.parse::<i32>()?,
+            _ => panic!("expected primary key column to exist and be a string"),
+        };
+
+        all_rows.extend(batch);
+
+        last_seen_id = last_id;
+
+        let checkpoint = SnapshotCheckpoint {
+            table_name: schema.table_name.clone(),
+            primary_key_column: primary_key.name.clone(),
+            last_seen_primary_key: last_seen_id.to_string(),
+        };
+
+        save_snapshot_checkpoint(checkpoint_path, &checkpoint)?;
+    }
+
+    Ok(all_rows)
+}
+
 pub fn build_select_query(schema: &TableSchema) -> String {
     let column_names = schema
         .columns

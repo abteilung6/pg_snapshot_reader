@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pg_snapshot_reader::{
-    SnapshotValue, discover_table_schema, read_snapshot_rows_batch, read_snapshot_rows_full,
+    SnapshotCheckpoint, SnapshotValue, discover_table_schema, read_snapshot_rows_batch,
+    read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
 };
 use tokio_postgres::{Client, Error, NoTls};
 
@@ -284,6 +285,136 @@ async fn reads_generic_snapshot_rows_from_schema() -> Result<(), Error> {
 
     let drop_sql = format!("DROP TABLE {}", table_name);
     client.execute(&drop_sql, &[]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn reads_full_snapshot_and_writes_checkpoint() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+    let table_name = unique_table_name();
+
+    let checkpoint_path =
+        std::env::temp_dir().join(format!("pg_snapshot_reader_{}_checkpoint.json", table_name));
+
+    if checkpoint_path.exists() {
+        std::fs::remove_file(&checkpoint_path)?;
+    }
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            event_id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_table_sql, &[]).await?;
+
+    let insert_sql = format!(
+        "
+        INSERT INTO {} (title)
+        VALUES
+            ('First event'),
+            ('Second event'),
+            ('Third event')
+        ",
+        table_name
+    );
+
+    client.execute(&insert_sql, &[]).await?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+
+    let rows =
+        read_snapshot_rows_full_with_checkpoint(&client, &schema, 2, &checkpoint_path).await?;
+
+    assert_eq!(rows.len(), 3);
+
+    let checkpoint_json = std::fs::read_to_string(&checkpoint_path)?;
+    let checkpoint: SnapshotCheckpoint = serde_json::from_str(&checkpoint_json)?;
+
+    assert_eq!(checkpoint.table_name, table_name);
+    assert_eq!(checkpoint.primary_key_column, "event_id");
+    assert_eq!(checkpoint.last_seen_primary_key, "3");
+
+    let drop_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_sql, &[]).await?;
+
+    std::fs::remove_file(checkpoint_path)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumes_full_snapshot_from_checkpoint() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+    let table_name = unique_table_name();
+
+    let checkpoint_path =
+        std::env::temp_dir().join(format!("pg_snapshot_reader_{}_checkpoint.json", table_name));
+
+    if checkpoint_path.exists() {
+        std::fs::remove_file(&checkpoint_path)?;
+    }
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            event_id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_table_sql, &[]).await?;
+
+    let insert_sql = format!(
+        "
+        INSERT INTO {} (title)
+        VALUES
+            ('First event'),
+            ('Second event'),
+            ('Third event')
+        ",
+        table_name
+    );
+
+    client.execute(&insert_sql, &[]).await?;
+
+    let checkpoint = SnapshotCheckpoint {
+        table_name: table_name.clone(),
+        primary_key_column: "event_id".to_string(),
+        last_seen_primary_key: "2".to_string(),
+    };
+
+    let checkpoint_json = serde_json::to_string_pretty(&checkpoint)?;
+    std::fs::write(&checkpoint_path, checkpoint_json)?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+
+    let rows =
+        read_snapshot_rows_full_with_checkpoint(&client, &schema, 2, &checkpoint_path).await?;
+
+    assert_eq!(rows.len(), 1);
+
+    assert_eq!(
+        rows[0].values.get("title"),
+        Some(&SnapshotValue::String("Third event".to_string()))
+    );
+
+    let updated_checkpoint_json = std::fs::read_to_string(&checkpoint_path)?;
+    let updated_checkpoint: SnapshotCheckpoint = serde_json::from_str(&updated_checkpoint_json)?;
+
+    assert_eq!(updated_checkpoint.last_seen_primary_key, "3");
+
+    let drop_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_sql, &[]).await?;
+
+    std::fs::remove_file(checkpoint_path)?;
 
     Ok(())
 }
