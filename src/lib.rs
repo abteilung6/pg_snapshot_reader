@@ -21,6 +21,18 @@ pub struct TableSchema {
     pub columns: Vec<Column>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapshotValue {
+    Int(i32),
+    Text(String),
+    Null,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SnapshotRow {
+    pub values: Vec<(String, SnapshotValue)>,
+}
+
 pub async fn read_users_batch(
     client: &Client,
     table_name: &str,
@@ -133,4 +145,40 @@ pub async fn discover_table_schema(
         table_name: table_name.to_string(),
         columns,
     })
+}
+
+pub async fn read_snapshot_rows_batch(
+    client: &Client,
+    table_name: &str,
+    last_seen_id: i32,
+    limit: i64,
+) -> Result<Vec<SnapshotRow>, Error> {
+    let query = format!(
+        "
+        SELECT id, name, email
+        FROM {}
+        WHERE id > $1
+        ORDER BY id
+        LIMIT $2
+        ",
+        table_name
+    );
+
+    let rows = client.query(&query, &[&last_seen_id, &limit]).await?;
+
+    let mut snapshot_rows = Vec::new();
+
+    for row in rows {
+        let snapshot_row = SnapshotRow {
+            values: vec![
+                ("id".to_string(), SnapshotValue::Int(row.get("id"))),
+                ("name".to_string(), SnapshotValue::Text(row.get("name"))),
+                ("email".to_string(), SnapshotValue::Text(row.get("email"))),
+            ],
+        };
+
+        snapshot_rows.push(snapshot_row);
+    }
+
+    Ok(snapshot_rows)
 }
