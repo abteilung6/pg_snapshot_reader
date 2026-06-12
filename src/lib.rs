@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::Path;
 use tokio_postgres::{Client, Error};
 
@@ -18,13 +20,13 @@ pub struct TableSchema {
     pub columns: Vec<Column>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SnapshotValue {
     String(String),
     Null,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotRow {
     pub values: HashMap<String, SnapshotValue>,
 }
@@ -364,4 +366,62 @@ mod tests {
         assert!(query.contains("ORDER BY post_id"));
         assert!(query.contains("LIMIT $2"));
     }
+}
+
+pub fn write_snapshot_rows_jsonl(path: &Path, rows: &[SnapshotRow]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    for row in rows {
+        let json = serde_json::to_string(row)?;
+        writeln!(file, "{}", json)?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn writes_snapshot_rows_as_jsonl() {
+    let path = std::env::temp_dir().join(format!(
+        "pg_snapshot_reader_stage_{}.jsonl",
+        std::process::id()
+    ));
+
+    if path.exists() {
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    let mut first_values = HashMap::new();
+    first_values.insert("id".to_string(), SnapshotValue::String("1".to_string()));
+    first_values.insert(
+        "name".to_string(),
+        SnapshotValue::String("Alice".to_string()),
+    );
+
+    let mut second_values = HashMap::new();
+    second_values.insert("id".to_string(), SnapshotValue::String("2".to_string()));
+    second_values.insert("name".to_string(), SnapshotValue::String("Bob".to_string()));
+
+    let rows = vec![
+        SnapshotRow {
+            values: first_values,
+        },
+        SnapshotRow {
+            values: second_values,
+        },
+    ];
+
+    write_snapshot_rows_jsonl(&path, &rows).unwrap();
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("Alice"));
+    assert!(lines[1].contains("Bob"));
+
+    std::fs::remove_file(path).unwrap();
 }
