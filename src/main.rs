@@ -1,10 +1,6 @@
 use tokio_postgres::{Error, NoTls};
 
-struct User {
-    id: i32,
-    name: String,
-    email: String,
-}
+use pg_snapshot_reader::read_users;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -25,31 +21,9 @@ async fn main() -> Result<(), Error> {
     for user in users {
         println!(
             "id={}, name={}, email={}",
-            user.id,
-            user.name,
-            user.email
+            user.id, user.name, user.email
         );
     }
 
     Ok(())
-}
-
-async fn read_users(
-    client: &tokio_postgres::Client
-) -> Result<Vec<User>, Error> {
-    let rows = client
-        .query("SELECT id, name, email FROM users", &[])
-        .await?;
-
-    let mut users = Vec::new();
-
-    for row in rows {
-        users.push(User {
-            id: row.get("id"),
-            name: row.get("name"),
-            email: row.get("email"),
-        });
-    }
-
-    Ok(users)
 }
