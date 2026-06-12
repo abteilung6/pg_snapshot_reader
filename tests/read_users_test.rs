@@ -210,21 +210,60 @@ async fn reads_generic_snapshot_rows_batch() -> Result<(), Error> {
 
     client.execute(&insert_sql, &[]).await?;
 
-    let rows = read_snapshot_rows_batch(&client, &table_name, 0, 10).await?;
+    let schema = discover_table_schema(&client, &table_name).await?;
+    let rows = read_snapshot_rows_batch(&client, &schema, 0, 10).await?;
 
     assert_eq!(rows.len(), 2);
 
-    assert_eq!(rows[0].values.get("id"), Some(&SnapshotValue::Int(1)));
+    let drop_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_sql, &[]).await?;
 
-    assert_eq!(
-        rows[0].values.get("name"),
-        Some(&SnapshotValue::Text("Alice".to_string()))
+    Ok(())
+}
+
+#[tokio::test]
+async fn reads_generic_snapshot_rows_from_schema() -> Result<(), Error> {
+    let client = connect_to_postgres().await?;
+    let table_name = unique_table_name();
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            views INTEGER NULL
+        )
+        ",
+        table_name
     );
 
-    assert_eq!(
-        rows[0].values.get("email"),
-        Some(&SnapshotValue::Text("alice@example.com".to_string()))
+    client.execute(&create_table_sql, &[]).await?;
+
+    let insert_sql = format!(
+        "
+        INSERT INTO {} (title, views)
+        VALUES
+            ('First post', 10),
+            ('Second post', NULL)
+        ",
+        table_name
     );
+
+    client.execute(&insert_sql, &[]).await?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+    let rows = read_snapshot_rows_batch(&client, &schema, 0, 10).await?;
+
+    assert_eq!(rows.len(), 2);
+
+    assert_eq!(
+        rows[0].values.get("title"),
+        Some(&SnapshotValue::Text("First post".to_string()))
+    );
+
+    assert_eq!(rows[0].values.get("views"), Some(&SnapshotValue::Int(10)));
+
+    assert_eq!(rows[1].values.get("views"), Some(&SnapshotValue::Null));
 
     let drop_sql = format!("DROP TABLE {}", table_name);
     client.execute(&drop_sql, &[]).await?;

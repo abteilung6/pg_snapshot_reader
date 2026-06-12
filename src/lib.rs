@@ -150,20 +150,11 @@ pub async fn discover_table_schema(
 
 pub async fn read_snapshot_rows_batch(
     client: &Client,
-    table_name: &str,
+    schema: &TableSchema,
     last_seen_id: i32,
     limit: i64,
 ) -> Result<Vec<SnapshotRow>, Error> {
-    let query = format!(
-        "
-        SELECT id, name, email
-        FROM {}
-        WHERE id > $1
-        ORDER BY id
-        LIMIT $2
-        ",
-        table_name
-    );
+    let query = build_select_query(schema);
 
     let rows = client.query(&query, &[&last_seen_id, &limit]).await?;
 
@@ -172,13 +163,34 @@ pub async fn read_snapshot_rows_batch(
     for row in rows {
         let mut values = HashMap::new();
 
-        values.insert("id".to_string(), SnapshotValue::Int(row.get("id")));
-        values.insert("name".to_string(), SnapshotValue::Text(row.get("name")));
-        values.insert("email".to_string(), SnapshotValue::Text(row.get("email")));
+        for column in &schema.columns {
+            let value = match column.postgres_type.as_str() {
+                "integer" => {
+                    let value: Option<i32> = row.get(column.name.as_str());
+                    match value {
+                        Some(v) => SnapshotValue::Int(v),
+                        None => SnapshotValue::Null,
+                    }
+                }
+                "text" => {
+                    let value: Option<String> = row.get(column.name.as_str());
+                    match value {
+                        Some(v) => SnapshotValue::Text(v),
+                        None => SnapshotValue::Null,
+                    }
+                }
+                unsupported_type => {
+                    panic!(
+                        "unsupported postgres type '{}' for column '{}'",
+                        unsupported_type, column.name
+                    );
+                }
+            };
 
-        let snapshot_row = SnapshotRow { values };
+            values.insert(column.name.clone(), value);
+        }
 
-        snapshot_rows.push(snapshot_row);
+        snapshot_rows.push(SnapshotRow { values });
     }
 
     Ok(snapshot_rows)
