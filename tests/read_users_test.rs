@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pg_snapshot_reader::{
     SnapshotCheckpoint, SnapshotValue, discover_table_schema, read_snapshot_rows_batch,
     read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
+    read_snapshot_rows_full_with_stage_and_checkpoint,
 };
 use tokio_postgres::{Client, Error, NoTls};
 
@@ -414,6 +415,87 @@ async fn resumes_full_snapshot_from_checkpoint() -> anyhow::Result<()> {
     let drop_sql = format!("DROP TABLE {}", table_name);
     client.execute(&drop_sql, &[]).await?;
 
+    std::fs::remove_file(checkpoint_path)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_snapshot_batches_to_stage_before_checkpoint() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+    let table_name = unique_table_name();
+
+    let stage_path =
+        std::env::temp_dir().join(format!("pg_snapshot_reader_{}_stage.jsonl", table_name));
+
+    let checkpoint_path =
+        std::env::temp_dir().join(format!("pg_snapshot_reader_{}_checkpoint.json", table_name));
+
+    if stage_path.exists() {
+        std::fs::remove_file(&stage_path)?;
+    }
+
+    if checkpoint_path.exists() {
+        std::fs::remove_file(&checkpoint_path)?;
+    }
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            event_id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_table_sql, &[]).await?;
+
+    let insert_sql = format!(
+        "
+        INSERT INTO {} (title)
+        VALUES
+            ('First event'),
+            ('Second event'),
+            ('Third event')
+        ",
+        table_name
+    );
+
+    client.execute(&insert_sql, &[]).await?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+
+    let rows = read_snapshot_rows_full_with_stage_and_checkpoint(
+        &client,
+        &schema,
+        2,
+        &stage_path,
+        &checkpoint_path,
+    )
+    .await?;
+
+    assert_eq!(rows.len(), 3);
+
+    let stage_content = std::fs::read_to_string(&stage_path)?;
+    let stage_lines: Vec<&str> = stage_content.lines().collect();
+
+    assert_eq!(stage_lines.len(), 3);
+    assert!(stage_lines[0].contains("First event"));
+    assert!(stage_lines[1].contains("Second event"));
+    assert!(stage_lines[2].contains("Third event"));
+
+    let checkpoint_json = std::fs::read_to_string(&checkpoint_path)?;
+    let checkpoint: SnapshotCheckpoint = serde_json::from_str(&checkpoint_json)?;
+
+    assert_eq!(checkpoint.table_name, table_name);
+    assert_eq!(checkpoint.primary_key_column, "event_id");
+    assert_eq!(checkpoint.last_seen_primary_key, "3");
+
+    let drop_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_sql, &[]).await?;
+
+    std::fs::remove_file(stage_path)?;
     std::fs::remove_file(checkpoint_path)?;
 
     Ok(())
