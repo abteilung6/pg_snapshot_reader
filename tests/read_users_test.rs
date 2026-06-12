@@ -1,13 +1,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-static TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 use pg_snapshot_reader::{
     SnapshotValue, discover_table_schema, read_full_snapshot, read_snapshot_rows_batch,
     read_users_batch,
 };
 use tokio_postgres::{Client, Error, NoTls};
+
+static TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_table_name() -> String {
     let millis = SystemTime::now()
@@ -215,6 +215,21 @@ async fn reads_generic_snapshot_rows_batch() -> Result<(), Error> {
 
     assert_eq!(rows.len(), 2);
 
+    assert_eq!(
+        rows[0].values.get("id"),
+        Some(&SnapshotValue::String("1".to_string()))
+    );
+
+    assert_eq!(
+        rows[0].values.get("name"),
+        Some(&SnapshotValue::String("Alice".to_string()))
+    );
+
+    assert_eq!(
+        rows[0].values.get("email"),
+        Some(&SnapshotValue::String("alice@example.com".to_string()))
+    );
+
     let drop_sql = format!("DROP TABLE {}", table_name);
     client.execute(&drop_sql, &[]).await?;
 
@@ -258,10 +273,13 @@ async fn reads_generic_snapshot_rows_from_schema() -> Result<(), Error> {
 
     assert_eq!(
         rows[0].values.get("title"),
-        Some(&SnapshotValue::Text("First post".to_string()))
+        Some(&SnapshotValue::String("First post".to_string()))
     );
 
-    assert_eq!(rows[0].values.get("views"), Some(&SnapshotValue::Int(10)));
+    assert_eq!(
+        rows[0].values.get("views"),
+        Some(&SnapshotValue::String("10".to_string()))
+    );
 
     assert_eq!(rows[1].values.get("views"), Some(&SnapshotValue::Null));
 

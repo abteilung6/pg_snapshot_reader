@@ -24,8 +24,7 @@ pub struct TableSchema {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SnapshotValue {
-    Int(i32),
-    Text(String),
+    String(String),
     Null,
 }
 
@@ -167,15 +166,25 @@ pub async fn read_snapshot_rows_batch(
             let value = match column.postgres_type.as_str() {
                 "integer" => {
                     let value: Option<i32> = row.get(column.name.as_str());
+
                     match value {
-                        Some(v) => SnapshotValue::Int(v),
+                        Some(v) => SnapshotValue::String(v.to_string()),
                         None => SnapshotValue::Null,
                     }
                 }
                 "text" => {
                     let value: Option<String> = row.get(column.name.as_str());
+
                     match value {
-                        Some(v) => SnapshotValue::Text(v),
+                        Some(v) => SnapshotValue::String(v),
+                        None => SnapshotValue::Null,
+                    }
+                }
+                "timestamp without time zone" => {
+                    let value: Option<std::time::SystemTime> = row.get(column.name.as_str());
+
+                    match value {
+                        Some(v) => SnapshotValue::String(format!("{:?}", v)),
                         None => SnapshotValue::Null,
                     }
                 }
