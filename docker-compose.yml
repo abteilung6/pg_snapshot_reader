@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: pg_snapshot_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: snapshot_demo
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - postgres_data:/var/lib/postgresql
+
+volumes:
+  postgres_data:
