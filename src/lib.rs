@@ -7,16 +7,24 @@ pub struct User {
     pub email: String,
 }
 
-pub async fn read_users_from_table(
+pub async fn read_users_batch(
     client: &Client,
     table_name: &str,
+    last_seen_id: i32,
+    limit: i64,
 ) -> Result<Vec<User>, Error> {
     let query = format!(
-        "SELECT id, name, email FROM {} ORDER BY id",
+        "
+        SELECT id, name, email
+        FROM {}
+        WHERE id > $1
+        ORDER BY id
+        LIMIT $2
+        ",
         table_name
     );
 
-    let rows = client.query(&query, &[]).await?;
+    let rows = client.query(&query, &[&last_seen_id, &limit]).await?;
 
     let mut users = Vec::new();
 

@@ -1,6 +1,6 @@
 use tokio_postgres::{Error, NoTls};
 
-use pg_snapshot_reader::read_users_from_table;
+use pg_snapshot_reader::read_users_batch;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -16,13 +16,30 @@ async fn main() -> Result<(), Error> {
         }
     });
 
-    let users = read_users_from_table(&client, "users").await?;
+    let mut last_seen_id = 0;
+    let batch_size = 2;
 
-    for user in users {
-        println!(
-            "id={}, name={}, email={}",
-            user.id, user.name, user.email
-        );
+    loop {
+        let users = read_users_batch(
+            &client,
+            "users",
+            last_seen_id,
+            batch_size,
+        )
+        .await?;
+
+        if users.is_empty() {
+            break;
+        }
+
+        for user in &users {
+            println!(
+                "id={}, name={}, email={}",
+                user.id, user.name, user.email
+            );
+        }
+
+        last_seen_id = users.last().unwrap().id;
     }
 
     Ok(())
