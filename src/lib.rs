@@ -182,3 +182,62 @@ pub async fn read_snapshot_rows_batch(
 
     Ok(snapshot_rows)
 }
+
+pub fn build_select_query(schema: &TableSchema) -> String {
+    let column_names = schema
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect::<Vec<String>>()
+        .join(", ");
+
+    format!(
+        "
+        SELECT {}
+        FROM {}
+        WHERE id > $1
+        ORDER BY id
+        LIMIT $2
+        ",
+        column_names, schema.table_name
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_select_query_from_schema() {
+        let schema = TableSchema {
+            table_name: "users".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    postgres_type: "integer".to_string(),
+                    is_nullable: false,
+                    is_primary_key: true,
+                },
+                Column {
+                    name: "name".to_string(),
+                    postgres_type: "text".to_string(),
+                    is_nullable: false,
+                    is_primary_key: false,
+                },
+                Column {
+                    name: "email".to_string(),
+                    postgres_type: "text".to_string(),
+                    is_nullable: false,
+                    is_primary_key: false,
+                },
+            ],
+        };
+
+        let query = build_select_query(&schema);
+
+        assert!(query.contains("SELECT id, name, email"));
+        assert!(query.contains("FROM users"));
+        assert!(query.contains("WHERE id > $1"));
+        assert!(query.contains("LIMIT $2"));
+    }
+}
