@@ -1,4 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use tokio_postgres::{Client, Error};
 
 #[derive(Debug, PartialEq)]
@@ -24,6 +27,66 @@ pub enum SnapshotValue {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SnapshotRow {
     pub values: HashMap<String, SnapshotValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotCheckpoint {
+    pub table_name: String,
+    pub primary_key_column: String,
+    pub last_seen_primary_key: String,
+}
+
+pub fn save_snapshot_checkpoint(
+    path: &Path,
+    checkpoint: &SnapshotCheckpoint,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(checkpoint)?;
+    fs::write(path, json)?;
+
+    Ok(())
+}
+
+pub fn load_snapshot_checkpoint(path: &Path) -> anyhow::Result<Option<SnapshotCheckpoint>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let json = fs::read_to_string(path)?;
+    let checkpoint = serde_json::from_str(&json)?;
+
+    Ok(Some(checkpoint))
+}
+
+#[test]
+fn saves_and_loads_snapshot_checkpoint() {
+    let path = std::env::temp_dir().join("pg_snapshot_reader_checkpoint_test.json");
+
+    let checkpoint = SnapshotCheckpoint {
+        table_name: "users".to_string(),
+        primary_key_column: "id".to_string(),
+        last_seen_primary_key: "42".to_string(),
+    };
+
+    save_snapshot_checkpoint(&path, &checkpoint).unwrap();
+
+    let loaded = load_snapshot_checkpoint(&path).unwrap();
+
+    assert_eq!(loaded, Some(checkpoint));
+
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn returns_none_when_checkpoint_file_does_not_exist() {
+    let path = std::env::temp_dir().join("pg_snapshot_reader_missing_checkpoint.json");
+
+    if path.exists() {
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    let loaded = load_snapshot_checkpoint(&path).unwrap();
+
+    assert_eq!(loaded, None);
 }
 
 impl TableSchema {
