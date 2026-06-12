@@ -38,3 +38,26 @@ pub async fn read_users_batch(
 
     Ok(users)
 }
+
+pub async fn read_full_snapshot(
+    client: &Client,
+    table_name: &str,
+    batch_size: i64,
+) -> Result<Vec<User>, Error> {
+    let mut all_users = Vec::new();
+    let mut last_seen_id = 0;
+
+    loop {
+        let batch = read_users_batch(client, table_name, last_seen_id, batch_size).await?;
+
+        if batch.is_empty() {
+            break;
+        }
+
+        last_seen_id = batch.last().unwrap().id;
+
+        all_users.extend(batch);
+    }
+
+    Ok(all_users)
+}
