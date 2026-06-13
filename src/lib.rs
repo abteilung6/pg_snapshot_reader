@@ -63,7 +63,13 @@ impl SnapshotRowWriter for ClickHouseSnapshotRowWriter {
             return Ok(());
         }
 
-        let query = build_clickhouse_insert_query(&self.table_name, rows)?;
+        let payload = build_clickhouse_json_each_row_payload(rows)?;
+
+        let query = format!(
+            "INSERT INTO {} FORMAT JSONEachRow\n{}",
+            quote_clickhouse_identifier(&self.table_name),
+            payload
+        );
 
         execute_clickhouse_query(&self.config, &query).await?;
 
@@ -550,6 +556,32 @@ pub fn build_clickhouse_insert_query(
     ))
 }
 
+pub fn build_clickhouse_json_each_row_payload(rows: &[SnapshotRow]) -> anyhow::Result<String> {
+    let mut lines = Vec::new();
+
+    for row in rows {
+        let mut json_row = serde_json::Map::new();
+
+        for (column_name, value) in &row.values {
+            match value {
+                SnapshotValue::String(value) => {
+                    json_row.insert(
+                        column_name.clone(),
+                        serde_json::Value::String(value.clone()),
+                    );
+                }
+                SnapshotValue::Null => {
+                    json_row.insert(column_name.clone(), serde_json::Value::Null);
+                }
+            }
+        }
+
+        lines.push(serde_json::Value::Object(json_row).to_string());
+    }
+
+    Ok(lines.join("\n"))
+}
+
 fn escape_clickhouse_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "\\'")
 }
@@ -920,5 +952,24 @@ mod tests {
         );
 
         assert!(map_postgres_type_to_clickhouse_type("jsonb").is_err());
+    }
+
+    #[test]
+    fn builds_clickhouse_json_each_row_payload() {
+        let mut values = HashMap::new();
+        values.insert("id".to_string(), SnapshotValue::String("1".to_string()));
+        values.insert(
+            "name".to_string(),
+            SnapshotValue::String("Alice".to_string()),
+        );
+        values.insert("deleted_at".to_string(), SnapshotValue::Null);
+
+        let rows = vec![SnapshotRow { values }];
+
+        let payload = build_clickhouse_json_each_row_payload(&rows).unwrap();
+
+        assert!(payload.contains("\"id\":\"1\""));
+        assert!(payload.contains("\"name\":\"Alice\""));
+        assert!(payload.contains("\"deleted_at\":null"));
     }
 }
