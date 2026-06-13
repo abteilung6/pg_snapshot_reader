@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 
 use tokio_postgres::NoTls;
@@ -34,8 +35,24 @@ async fn main() -> anyhow::Result<()> {
 
     println!("clickhouse table ensured: users_snapshot");
 
+    pg_snapshot_reader::execute_clickhouse_query(
+        &clickhouse_config,
+        "TRUNCATE TABLE users_snapshot",
+    )
+    .await?;
+
+    println!("clickhouse table truncated: users_snapshot");
+
     let stage_path = Path::new("users_snapshot_stage.jsonl");
     let checkpoint_path = Path::new("users_snapshot_checkpoint.json");
+
+    if stage_path.exists() {
+        fs::remove_file(stage_path)?;
+    }
+
+    if checkpoint_path.exists() {
+        fs::remove_file(checkpoint_path)?;
+    }
 
     let rows = read_snapshot_rows_full_with_stage_and_checkpoint(
         &client,
