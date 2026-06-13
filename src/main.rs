@@ -5,16 +5,27 @@ use tokio_postgres::NoTls;
 
 use pg_snapshot_reader::{
     ClickHouseConfig, ClickHouseSnapshotRowWriter, count_clickhouse_rows,
-    create_clickhouse_snapshot_table, discover_table_schema,
+    create_clickhouse_snapshot_table, discover_table_schema, execute_clickhouse_query,
     read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
 };
 
+const POSTGRES_CONNECTION_STRING: &str =
+    "host=localhost port=5432 user=postgres password=postgres dbname=snapshot_demo";
+
+const SOURCE_TABLE: &str = "users";
+const CLICKHOUSE_TABLE: &str = "users_snapshot";
+
+const CLICKHOUSE_URL: &str = "http://localhost:8123";
+const CLICKHOUSE_DATABASE: &str = "snapshot_demo";
+const CLICKHOUSE_USER: &str = "snapshot_user";
+const CLICKHOUSE_PASSWORD: &str = "snapshot_password";
+
+const STAGE_FILE: &str = "users_snapshot_stage.jsonl";
+const CHECKPOINT_FILE: &str = "users_snapshot_checkpoint.json";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let connection_string =
-        "host=localhost port=5432 user=postgres password=postgres dbname=snapshot_demo";
-
-    let (client, connection) = tokio_postgres::connect(connection_string, NoTls).await?;
+    let (client, connection) = tokio_postgres::connect(POSTGRES_CONNECTION_STRING, NoTls).await?;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -22,29 +33,29 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let schema = discover_table_schema(&client, "users").await?;
+    let schema = discover_table_schema(&client, SOURCE_TABLE).await?;
 
     let clickhouse_config = ClickHouseConfig {
-        url: "http://localhost:8123".to_string(),
-        database: "snapshot_demo".to_string(),
-        user: "snapshot_user".to_string(),
-        password: "snapshot_password".to_string(),
+        url: CLICKHOUSE_URL.to_string(),
+        database: CLICKHOUSE_DATABASE.to_string(),
+        user: CLICKHOUSE_USER.to_string(),
+        password: CLICKHOUSE_PASSWORD.to_string(),
     };
 
-    create_clickhouse_snapshot_table(&clickhouse_config, &schema, "users_snapshot").await?;
+    create_clickhouse_snapshot_table(&clickhouse_config, &schema, CLICKHOUSE_TABLE).await?;
 
-    println!("clickhouse table ensured: users_snapshot");
+    println!("clickhouse table ensured: {}", CLICKHOUSE_TABLE);
 
-    pg_snapshot_reader::execute_clickhouse_query(
+    execute_clickhouse_query(
         &clickhouse_config,
-        "TRUNCATE TABLE users_snapshot",
+        &format!("TRUNCATE TABLE {}", CLICKHOUSE_TABLE),
     )
     .await?;
 
-    println!("clickhouse table truncated: users_snapshot");
+    println!("clickhouse table truncated: {}", CLICKHOUSE_TABLE);
 
-    let stage_path = Path::new("users_snapshot_stage.jsonl");
-    let checkpoint_path = Path::new("users_snapshot_checkpoint.json");
+    let stage_path = Path::new(STAGE_FILE);
+    let checkpoint_path = Path::new(CHECKPOINT_FILE);
 
     if stage_path.exists() {
         fs::remove_file(stage_path)?;
@@ -69,12 +80,12 @@ async fn main() -> anyhow::Result<()> {
 
     let writer = ClickHouseSnapshotRowWriter {
         config: clickhouse_config,
-        table_name: "users_snapshot".to_string(),
+        table_name: CLICKHOUSE_TABLE.to_string(),
     };
 
     write_staged_snapshot_rows(stage_path, &writer).await?;
 
-    let clickhouse_row_count = count_clickhouse_rows(&writer.config, "users_snapshot").await?;
+    let clickhouse_row_count = count_clickhouse_rows(&writer.config, CLICKHOUSE_TABLE).await?;
 
     println!("clickhouse rows written: {}", clickhouse_row_count);
 
