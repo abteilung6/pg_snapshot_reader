@@ -12,5 +12,20 @@ services:
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
       - postgres_data:/var/lib/postgresql
 
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3
+    container_name: pg_snapshot_clickhouse
+    environment:
+      CLICKHOUSE_DB: snapshot_demo
+      CLICKHOUSE_USER: snapshot_user
+      CLICKHOUSE_PASSWORD: snapshot_password
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+
 volumes:
   postgres_data:
+  clickhouse_data:
