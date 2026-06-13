@@ -2,9 +2,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pg_snapshot_reader::{
-    SnapshotCheckpoint, SnapshotValue, discover_table_schema, read_snapshot_rows_batch,
-    read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
-    read_snapshot_rows_full_with_stage_and_checkpoint,
+    ClickHouseConfig, ClickHouseSnapshotRowWriter, SnapshotCheckpoint, SnapshotValue,
+    count_clickhouse_rows, create_clickhouse_snapshot_table, discover_table_schema,
+    execute_clickhouse_query, read_snapshot_rows_batch, read_snapshot_rows_full,
+    read_snapshot_rows_full_with_checkpoint, read_snapshot_rows_full_with_stage_and_checkpoint,
+    write_staged_snapshot_rows,
 };
 use tokio_postgres::{Client, Error, NoTls};
 
@@ -494,6 +496,103 @@ async fn writes_snapshot_batches_to_stage_before_checkpoint() -> anyhow::Result<
 
     let drop_sql = format!("DROP TABLE {}", table_name);
     client.execute(&drop_sql, &[]).await?;
+
+    std::fs::remove_file(stage_path)?;
+    std::fs::remove_file(checkpoint_path)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn writes_postgres_snapshot_to_clickhouse_end_to_end() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+    let table_name = unique_table_name();
+    let clickhouse_table_name = format!("{}_snapshot", table_name);
+
+    let stage_path =
+        std::env::temp_dir().join(format!("pg_snapshot_reader_{}_stage.jsonl", table_name));
+
+    let checkpoint_path =
+        std::env::temp_dir().join(format!("pg_snapshot_reader_{}_checkpoint.json", table_name));
+
+    if stage_path.exists() {
+        std::fs::remove_file(&stage_path)?;
+    }
+
+    if checkpoint_path.exists() {
+        std::fs::remove_file(&checkpoint_path)?;
+    }
+
+    let create_postgres_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            user_id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_postgres_table_sql, &[]).await?;
+
+    let insert_postgres_rows_sql = format!(
+        "
+        INSERT INTO {} (name, email)
+        VALUES
+            ('Alice', 'alice@example.com'),
+            ('Bob', 'bob@example.com'),
+            ('Charlie', 'charlie@example.com')
+        ",
+        table_name
+    );
+
+    client.execute(&insert_postgres_rows_sql, &[]).await?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+
+    let clickhouse_config = ClickHouseConfig {
+        url: "http://localhost:8123".to_string(),
+        database: "snapshot_demo".to_string(),
+        user: "snapshot_user".to_string(),
+        password: "snapshot_password".to_string(),
+    };
+
+    let drop_clickhouse_table_sql = format!("DROP TABLE IF EXISTS {}", clickhouse_table_name);
+
+    execute_clickhouse_query(&clickhouse_config, &drop_clickhouse_table_sql).await?;
+
+    create_clickhouse_snapshot_table(&clickhouse_config, &schema, &clickhouse_table_name).await?;
+
+    let rows = read_snapshot_rows_full_with_stage_and_checkpoint(
+        &client,
+        &schema,
+        2,
+        &stage_path,
+        &checkpoint_path,
+    )
+    .await?;
+
+    assert_eq!(rows.len(), 3);
+
+    let writer = ClickHouseSnapshotRowWriter {
+        config: clickhouse_config.clone(),
+        table_name: clickhouse_table_name.clone(),
+    };
+
+    write_staged_snapshot_rows(&stage_path, &writer).await?;
+
+    let clickhouse_count =
+        count_clickhouse_rows(&clickhouse_config, &clickhouse_table_name).await?;
+
+    assert_eq!(clickhouse_count, 3);
+
+    let drop_postgres_table_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_postgres_table_sql, &[]).await?;
+
+    let drop_clickhouse_table_sql = format!("DROP TABLE IF EXISTS {}", clickhouse_table_name);
+
+    execute_clickhouse_query(&clickhouse_config, &drop_clickhouse_table_sql).await?;
 
     std::fs::remove_file(stage_path)?;
     std::fs::remove_file(checkpoint_path)?;
