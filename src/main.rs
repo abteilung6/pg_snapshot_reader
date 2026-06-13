@@ -1,9 +1,14 @@
-use tokio_postgres::{Error, NoTls};
+use std::path::Path;
 
-use pg_snapshot_reader::{discover_table_schema, read_snapshot_rows_full};
+use tokio_postgres::NoTls;
+
+use pg_snapshot_reader::{
+    DebugSnapshotRowWriter, discover_table_schema,
+    read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
+};
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> anyhow::Result<()> {
     let connection_string =
         "host=localhost port=5432 user=postgres password=postgres dbname=snapshot_demo";
 
@@ -17,13 +22,25 @@ async fn main() -> Result<(), Error> {
 
     let schema = discover_table_schema(&client, "users").await?;
 
-    println!("{:#?}", schema);
+    let stage_path = Path::new("users_snapshot_stage.jsonl");
+    let checkpoint_path = Path::new("users_snapshot_checkpoint.json");
 
-    let rows = read_snapshot_rows_full(&client, &schema, 2).await?;
+    let rows = read_snapshot_rows_full_with_stage_and_checkpoint(
+        &client,
+        &schema,
+        2,
+        stage_path,
+        checkpoint_path,
+    )
+    .await?;
 
-    for row in rows {
-        println!("{:#?}", row);
-    }
+    println!("snapshot rows read: {}", rows.len());
+    println!("stage written to: {}", stage_path.display());
+    println!("checkpoint written to: {}", checkpoint_path.display());
+
+    let writer = DebugSnapshotRowWriter;
+
+    write_staged_snapshot_rows(stage_path, &writer).await?;
 
     Ok(())
 }

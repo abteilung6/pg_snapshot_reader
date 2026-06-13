@@ -1,1 +1,3 @@
 /target
+users_snapshot_stage.jsonl
+users_snapshot_checkpoint.json
