@@ -84,6 +84,13 @@ pub struct SnapshotCheckpoint {
     pub last_seen_primary_key: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotBoundary {
+    pub table_name: String,
+    pub snapshot_id: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -111,6 +118,40 @@ pub fn load_snapshot_checkpoint(path: &Path) -> anyhow::Result<Option<SnapshotCh
     let checkpoint = serde_json::from_str(&json)?;
 
     Ok(Some(checkpoint))
+}
+
+pub fn save_snapshot_boundary(path: &Path, boundary: &SnapshotBoundary) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(boundary)?;
+    fs::write(path, json)?;
+
+    Ok(())
+}
+
+pub fn load_snapshot_boundary(path: &Path) -> anyhow::Result<Option<SnapshotBoundary>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let json = fs::read_to_string(path)?;
+    let boundary = serde_json::from_str(&json)?;
+
+    Ok(Some(boundary))
+}
+
+pub fn create_local_snapshot_boundary(table_name: &str) -> SnapshotBoundary {
+    SnapshotBoundary {
+        table_name: table_name.to_string(),
+        snapshot_id: format!(
+            "local-snapshot-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ),
+        created_at: chrono::Utc::now()
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string(),
+    }
 }
 
 #[test]
@@ -971,5 +1012,31 @@ mod tests {
         assert!(payload.contains("\"id\":\"1\""));
         assert!(payload.contains("\"name\":\"Alice\""));
         assert!(payload.contains("\"deleted_at\":null"));
+    }
+
+    #[test]
+    fn saves_and_loads_snapshot_boundary() {
+        let path = std::env::temp_dir().join(format!(
+            "pg_snapshot_reader_boundary_{}.json",
+            std::process::id()
+        ));
+
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        let boundary = SnapshotBoundary {
+            table_name: "users".to_string(),
+            snapshot_id: "local-snapshot-test".to_string(),
+            created_at: "2026-01-01 00:00:00.000".to_string(),
+        };
+
+        save_snapshot_boundary(&path, &boundary).unwrap();
+
+        let loaded = load_snapshot_boundary(&path).unwrap();
+
+        assert_eq!(loaded, Some(boundary));
+
+        std::fs::remove_file(path).unwrap();
     }
 }
