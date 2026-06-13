@@ -254,6 +254,33 @@ pub async fn discover_table_schema(
     })
 }
 
+pub async fn create_publication_for_table(
+    client: &Client,
+    publication_name: &str,
+    table_name: &str,
+) -> Result<(), Error> {
+    let drop_query = format!(
+        "DROP PUBLICATION IF EXISTS {}",
+        quote_postgres_identifier(publication_name)
+    );
+
+    client.execute(&drop_query, &[]).await?;
+
+    let create_query = format!(
+        "CREATE PUBLICATION {} FOR TABLE {}",
+        quote_postgres_identifier(publication_name),
+        quote_postgres_identifier(table_name)
+    );
+
+    client.execute(&create_query, &[]).await?;
+
+    Ok(())
+}
+
+fn quote_postgres_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
 pub async fn read_snapshot_rows_batch(
     client: &Client,
     schema: &TableSchema,
@@ -1038,5 +1065,14 @@ mod tests {
         assert_eq!(loaded, Some(boundary));
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn quotes_postgres_identifier() {
+        assert_eq!(quote_postgres_identifier("users"), "\"users\"");
+        assert_eq!(
+            quote_postgres_identifier("weird\"name"),
+            "\"weird\"\"name\""
+        );
     }
 }

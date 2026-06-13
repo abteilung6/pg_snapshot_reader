@@ -3,10 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pg_snapshot_reader::{
     ClickHouseConfig, ClickHouseSnapshotRowWriter, SnapshotCheckpoint, SnapshotValue,
-    count_clickhouse_rows, create_clickhouse_snapshot_table, discover_table_schema,
-    execute_clickhouse_query, read_snapshot_rows_batch, read_snapshot_rows_full,
-    read_snapshot_rows_full_with_checkpoint, read_snapshot_rows_full_with_stage_and_checkpoint,
-    write_staged_snapshot_rows,
+    count_clickhouse_rows, create_clickhouse_snapshot_table, create_publication_for_table,
+    discover_table_schema, execute_clickhouse_query, read_snapshot_rows_batch,
+    read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
+    read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
 };
 use tokio_postgres::{Client, Error, NoTls};
 
@@ -596,6 +596,69 @@ async fn writes_postgres_snapshot_to_clickhouse_end_to_end() -> anyhow::Result<(
 
     std::fs::remove_file(stage_path)?;
     std::fs::remove_file(checkpoint_path)?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn creates_publication_for_table() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+    let table_name = unique_table_name();
+    let publication_name = format!("{}_publication", table_name);
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_table_sql, &[]).await?;
+
+    create_publication_for_table(&client, &publication_name, &table_name).await?;
+
+    let publication_rows = client
+        .query(
+            "
+            SELECT pubname
+            FROM pg_publication
+            WHERE pubname = $1
+            ",
+            &[&publication_name],
+        )
+        .await?;
+
+    assert_eq!(publication_rows.len(), 1);
+
+    let table_rows = client
+        .query(
+            "
+            SELECT
+                p.pubname,
+                c.relname
+            FROM pg_publication p
+            JOIN pg_publication_rel pr
+              ON p.oid = pr.prpubid
+            JOIN pg_class c
+              ON pr.prrelid = c.oid
+            WHERE p.pubname = $1
+              AND c.relname = $2
+            ",
+            &[&publication_name, &table_name],
+        )
+        .await?;
+
+    assert_eq!(table_rows.len(), 1);
+
+    let drop_publication_sql = format!("DROP PUBLICATION IF EXISTS {}", publication_name);
+
+    client.execute(&drop_publication_sql, &[]).await?;
+
+    let drop_table_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_table_sql, &[]).await?;
 
     Ok(())
 }
