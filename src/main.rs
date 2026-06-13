@@ -3,8 +3,9 @@ use std::path::Path;
 use tokio_postgres::NoTls;
 
 use pg_snapshot_reader::{
-    DebugSnapshotRowWriter, discover_table_schema,
-    read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
+    ClickHouseConfig, DebugSnapshotRowWriter, create_clickhouse_snapshot_table,
+    discover_table_schema, read_snapshot_rows_full_with_stage_and_checkpoint,
+    write_staged_snapshot_rows,
 };
 
 #[tokio::main]
@@ -21,6 +22,17 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let schema = discover_table_schema(&client, "users").await?;
+
+    let clickhouse_config = ClickHouseConfig {
+        url: "http://localhost:8123".to_string(),
+        database: "snapshot_demo".to_string(),
+        user: "snapshot_user".to_string(),
+        password: "snapshot_password".to_string(),
+    };
+
+    create_clickhouse_snapshot_table(&clickhouse_config, &schema, "users_snapshot").await?;
+
+    println!("clickhouse table ensured: users_snapshot");
 
     let stage_path = Path::new("users_snapshot_stage.jsonl");
     let checkpoint_path = Path::new("users_snapshot_checkpoint.json");

@@ -57,6 +57,14 @@ pub struct SnapshotCheckpoint {
     pub last_seen_primary_key: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClickHouseConfig {
+    pub url: String,
+    pub database: String,
+    pub user: String,
+    pub password: String,
+}
+
 pub fn save_snapshot_checkpoint(
     path: &Path,
     checkpoint: &SnapshotCheckpoint,
@@ -419,6 +427,31 @@ pub fn build_select_query(schema: &TableSchema) -> String {
     )
 }
 
+pub fn build_clickhouse_create_snapshot_table_query(
+    schema: &TableSchema,
+    clickhouse_table: &str,
+) -> String {
+    let column_definitions = schema
+        .columns
+        .iter()
+        .map(|column| format!("    {} String", quote_clickhouse_identifier(&column.name)))
+        .collect::<Vec<String>>()
+        .join(",\n");
+
+    let primary_key = schema.primary_key_column();
+
+    format!(
+        "CREATE TABLE IF NOT EXISTS {}\n(\n{}\n)\nENGINE = MergeTree\nORDER BY {}",
+        quote_clickhouse_identifier(clickhouse_table),
+        column_definitions,
+        quote_clickhouse_identifier(&primary_key.name)
+    )
+}
+
+fn quote_clickhouse_identifier(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
+}
+
 pub fn write_snapshot_rows_jsonl(path: &Path, rows: &[SnapshotRow]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -548,6 +581,40 @@ where
     Ok(())
 }
 
+pub async fn execute_clickhouse_query(
+    config: &ClickHouseConfig,
+    query: &str,
+) -> anyhow::Result<()> {
+    let response = reqwest::Client::new()
+        .post(&config.url)
+        .query(&[("database", &config.database)])
+        .basic_auth(&config.user, Some(&config.password))
+        .body(query.to_string())
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        anyhow::bail!("ClickHouse query failed with status {}: {}", status, body);
+    }
+
+    Ok(())
+}
+
+pub async fn create_clickhouse_snapshot_table(
+    config: &ClickHouseConfig,
+    schema: &TableSchema,
+    clickhouse_table: &str,
+) -> anyhow::Result<()> {
+    let query = build_clickhouse_create_snapshot_table_query(schema, clickhouse_table);
+
+    execute_clickhouse_query(config, &query).await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +688,41 @@ mod tests {
         write_staged_snapshot_rows(&path, &writer).await.unwrap();
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn builds_clickhouse_create_snapshot_table_query() {
+        let schema = TableSchema {
+            table_name: "users".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    postgres_type: "integer".to_string(),
+                    is_nullable: false,
+                    is_primary_key: true,
+                },
+                Column {
+                    name: "name".to_string(),
+                    postgres_type: "text".to_string(),
+                    is_nullable: false,
+                    is_primary_key: false,
+                },
+                Column {
+                    name: "email".to_string(),
+                    postgres_type: "text".to_string(),
+                    is_nullable: false,
+                    is_primary_key: false,
+                },
+            ],
+        };
+
+        let query = build_clickhouse_create_snapshot_table_query(&schema, "users_snapshot");
+
+        assert!(query.contains("CREATE TABLE IF NOT EXISTS `users_snapshot`"));
+        assert!(query.contains("`id` String"));
+        assert!(query.contains("`name` String"));
+        assert!(query.contains("`email` String"));
+        assert!(query.contains("ENGINE = MergeTree"));
+        assert!(query.contains("ORDER BY `id`"));
     }
 }
