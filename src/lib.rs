@@ -432,6 +432,20 @@ pub async fn read_snapshot_rows_full_with_stage_and_checkpoint(
     Ok(all_rows)
 }
 
+pub fn map_postgres_type_to_clickhouse_type(postgres_type: &str) -> anyhow::Result<&'static str> {
+    match postgres_type {
+        "integer" => Ok("Int32"),
+        "text" => Ok("String"),
+        "timestamp without time zone" => Ok("DateTime64(3)"),
+        unsupported_type => {
+            anyhow::bail!(
+                "unsupported postgres type for ClickHouse mapping: {}",
+                unsupported_type
+            )
+        }
+    }
+}
+
 pub fn build_select_query(schema: &TableSchema) -> String {
     let column_names = schema
         .columns
@@ -461,7 +475,16 @@ pub fn build_clickhouse_create_snapshot_table_query(
     let column_definitions = schema
         .columns
         .iter()
-        .map(|column| format!("    {} String", quote_clickhouse_identifier(&column.name)))
+        .map(|column| {
+            let clickhouse_type = map_postgres_type_to_clickhouse_type(&column.postgres_type)
+                .expect("unsupported postgres type");
+
+            format!(
+                "    {} {}",
+                quote_clickhouse_identifier(&column.name),
+                clickhouse_type
+            )
+        })
         .collect::<Vec<String>>()
         .join(",\n");
 
@@ -840,7 +863,7 @@ mod tests {
         let query = build_clickhouse_create_snapshot_table_query(&schema, "users_snapshot");
 
         assert!(query.contains("CREATE TABLE IF NOT EXISTS `users_snapshot`"));
-        assert!(query.contains("`id` String"));
+        assert!(query.contains("`id` Int32"));
         assert!(query.contains("`name` String"));
         assert!(query.contains("`email` String"));
         assert!(query.contains("ENGINE = MergeTree"));
@@ -877,5 +900,25 @@ mod tests {
         assert!(query.contains("'Alice'"));
         assert!(query.contains("'2'"));
         assert!(query.contains("'Bob'"));
+    }
+
+    #[test]
+    fn maps_basic_postgres_types_to_clickhouse_types() {
+        assert_eq!(
+            map_postgres_type_to_clickhouse_type("integer").unwrap(),
+            "Int32"
+        );
+
+        assert_eq!(
+            map_postgres_type_to_clickhouse_type("text").unwrap(),
+            "String"
+        );
+
+        assert_eq!(
+            map_postgres_type_to_clickhouse_type("timestamp without time zone").unwrap(),
+            "DateTime64(3)"
+        );
+
+        assert!(map_postgres_type_to_clickhouse_type("jsonb").is_err());
     }
 }
