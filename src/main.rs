@@ -5,8 +5,9 @@ use tokio_postgres::NoTls;
 
 use pg_snapshot_reader::{
     ClickHouseConfig, ClickHouseSnapshotRowWriter, count_clickhouse_rows,
-    create_clickhouse_snapshot_table, discover_table_schema, execute_clickhouse_query,
-    read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
+    create_clickhouse_snapshot_table, create_local_snapshot_boundary, discover_table_schema,
+    execute_clickhouse_query, read_snapshot_rows_full_with_stage_and_checkpoint,
+    save_snapshot_boundary, write_staged_snapshot_rows,
 };
 
 const POSTGRES_CONNECTION_STRING: &str =
@@ -22,6 +23,7 @@ const CLICKHOUSE_PASSWORD: &str = "snapshot_password";
 
 const STAGE_FILE: &str = "users_snapshot_stage.jsonl";
 const CHECKPOINT_FILE: &str = "users_snapshot_checkpoint.json";
+const BOUNDARY_FILE: &str = "users_snapshot_boundary.json";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -56,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
 
     let stage_path = Path::new(STAGE_FILE);
     let checkpoint_path = Path::new(CHECKPOINT_FILE);
+    let boundary_path = Path::new(BOUNDARY_FILE);
 
     if stage_path.exists() {
         fs::remove_file(stage_path)?;
@@ -64,6 +67,15 @@ async fn main() -> anyhow::Result<()> {
     if checkpoint_path.exists() {
         fs::remove_file(checkpoint_path)?;
     }
+
+    if boundary_path.exists() {
+        fs::remove_file(boundary_path)?;
+    }
+
+    let boundary = create_local_snapshot_boundary(SOURCE_TABLE);
+    save_snapshot_boundary(boundary_path, &boundary)?;
+
+    println!("snapshot boundary written to: {}", boundary_path.display());
 
     let rows = read_snapshot_rows_full_with_stage_and_checkpoint(
         &client,
