@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -243,7 +244,13 @@ pub async fn read_snapshot_rows_batch(
                     let value: Option<std::time::SystemTime> = row.get(column.name.as_str());
 
                     match value {
-                        Some(v) => SnapshotValue::String(format!("{:?}", v)),
+                        Some(v) => {
+                            let datetime: DateTime<Utc> = v.into();
+
+                            SnapshotValue::String(
+                                datetime.format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+                            )
+                        }
                         None => SnapshotValue::Null,
                     }
                 }
