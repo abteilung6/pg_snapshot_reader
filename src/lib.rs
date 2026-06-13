@@ -491,3 +491,64 @@ fn writes_snapshot_rows_as_jsonl() {
 
     std::fs::remove_file(path).unwrap();
 }
+
+pub fn read_snapshot_rows_jsonl(path: &Path) -> anyhow::Result<Vec<SnapshotRow>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content = fs::read_to_string(path)?;
+
+    let mut rows = Vec::new();
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let row: SnapshotRow = serde_json::from_str(line)?;
+        rows.push(row);
+    }
+
+    Ok(rows)
+}
+
+#[test]
+fn reads_snapshot_rows_from_jsonl() {
+    let path = std::env::temp_dir().join(format!(
+        "pg_snapshot_reader_stage_read_{}.jsonl",
+        std::process::id()
+    ));
+
+    if path.exists() {
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    let mut first_values = HashMap::new();
+    first_values.insert("id".to_string(), SnapshotValue::String("1".to_string()));
+    first_values.insert(
+        "name".to_string(),
+        SnapshotValue::String("Alice".to_string()),
+    );
+
+    let mut second_values = HashMap::new();
+    second_values.insert("id".to_string(), SnapshotValue::String("2".to_string()));
+    second_values.insert("name".to_string(), SnapshotValue::String("Bob".to_string()));
+
+    let original_rows = vec![
+        SnapshotRow {
+            values: first_values,
+        },
+        SnapshotRow {
+            values: second_values,
+        },
+    ];
+
+    write_snapshot_rows_jsonl(&path, &original_rows).unwrap();
+
+    let loaded_rows = read_snapshot_rows_jsonl(&path).unwrap();
+
+    assert_eq!(loaded_rows, original_rows);
+
+    std::fs::remove_file(path).unwrap();
+}
