@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -29,6 +30,24 @@ pub enum SnapshotValue {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotRow {
     pub values: HashMap<String, SnapshotValue>,
+}
+
+#[async_trait]
+pub trait SnapshotRowWriter {
+    async fn write_rows(&self, rows: &[SnapshotRow]) -> anyhow::Result<()>;
+}
+
+pub struct DebugSnapshotRowWriter;
+
+#[async_trait]
+impl SnapshotRowWriter for DebugSnapshotRowWriter {
+    async fn write_rows(&self, rows: &[SnapshotRow]) -> anyhow::Result<()> {
+        for row in rows {
+            println!("{:#?}", row);
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -400,40 +419,6 @@ pub fn build_select_query(schema: &TableSchema) -> String {
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builds_select_query_from_schema() {
-        let schema = TableSchema {
-            table_name: "posts".to_string(),
-            columns: vec![
-                Column {
-                    name: "post_id".to_string(),
-                    postgres_type: "integer".to_string(),
-                    is_nullable: false,
-                    is_primary_key: true,
-                },
-                Column {
-                    name: "title".to_string(),
-                    postgres_type: "text".to_string(),
-                    is_nullable: false,
-                    is_primary_key: false,
-                },
-            ],
-        };
-
-        let query = build_select_query(&schema);
-
-        assert!(query.contains("SELECT post_id, title"));
-        assert!(query.contains("FROM posts"));
-        assert!(query.contains("WHERE post_id > $1"));
-        assert!(query.contains("ORDER BY post_id"));
-        assert!(query.contains("LIMIT $2"));
-    }
-}
-
 pub fn write_snapshot_rows_jsonl(path: &Path, rows: &[SnapshotRow]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -551,4 +536,90 @@ fn reads_snapshot_rows_from_jsonl() {
     assert_eq!(loaded_rows, original_rows);
 
     std::fs::remove_file(path).unwrap();
+}
+
+pub async fn write_staged_snapshot_rows<W>(stage_path: &Path, writer: &W) -> anyhow::Result<()>
+where
+    W: SnapshotRowWriter + Sync,
+{
+    let rows = read_snapshot_rows_jsonl(stage_path)?;
+    writer.write_rows(&rows).await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    #[test]
+    fn builds_select_query_from_schema() {
+        let schema = TableSchema {
+            table_name: "posts".to_string(),
+            columns: vec![
+                Column {
+                    name: "post_id".to_string(),
+                    postgres_type: "integer".to_string(),
+                    is_nullable: false,
+                    is_primary_key: true,
+                },
+                Column {
+                    name: "title".to_string(),
+                    postgres_type: "text".to_string(),
+                    is_nullable: false,
+                    is_primary_key: false,
+                },
+            ],
+        };
+
+        let query = build_select_query(&schema);
+
+        assert!(query.contains("SELECT post_id, title"));
+        assert!(query.contains("FROM posts"));
+        assert!(query.contains("WHERE post_id > $1"));
+        assert!(query.contains("ORDER BY post_id"));
+        assert!(query.contains("LIMIT $2"));
+    }
+
+    struct CountingSnapshotRowWriter {
+        expected_rows: usize,
+    }
+
+    #[async_trait]
+    impl SnapshotRowWriter for CountingSnapshotRowWriter {
+        async fn write_rows(&self, rows: &[SnapshotRow]) -> anyhow::Result<()> {
+            assert_eq!(rows.len(), self.expected_rows);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn writes_staged_snapshot_rows_to_writer() {
+        let path = std::env::temp_dir().join(format!(
+            "pg_snapshot_reader_stage_writer_{}.jsonl",
+            std::process::id()
+        ));
+
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        let mut values = HashMap::new();
+        values.insert("id".to_string(), SnapshotValue::String("1".to_string()));
+        values.insert(
+            "name".to_string(),
+            SnapshotValue::String("Alice".to_string()),
+        );
+
+        let rows = vec![SnapshotRow { values }];
+
+        write_snapshot_rows_jsonl(&path, &rows).unwrap();
+
+        let writer = CountingSnapshotRowWriter { expected_rows: 1 };
+
+        write_staged_snapshot_rows(&path, &writer).await.unwrap();
+
+        std::fs::remove_file(path).unwrap();
+    }
 }
