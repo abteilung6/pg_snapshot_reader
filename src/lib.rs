@@ -277,6 +277,28 @@ pub async fn create_publication_for_table(
     Ok(())
 }
 
+pub async fn create_logical_replication_slot(
+    client: &Client,
+    slot_name: &str,
+) -> Result<(), Error> {
+    let drop_query = "
+        SELECT pg_drop_replication_slot(slot_name)
+        FROM pg_replication_slots
+        WHERE slot_name = $1
+    ";
+
+    client.execute(drop_query, &[&slot_name]).await?;
+
+    let create_query = "
+        SELECT *
+        FROM pg_create_logical_replication_slot($1, 'pgoutput')
+    ";
+
+    client.query(create_query, &[&slot_name]).await?;
+
+    Ok(())
+}
+
 fn quote_postgres_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }

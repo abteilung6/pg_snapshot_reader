@@ -3,9 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pg_snapshot_reader::{
     ClickHouseConfig, ClickHouseSnapshotRowWriter, SnapshotCheckpoint, SnapshotValue,
-    count_clickhouse_rows, create_clickhouse_snapshot_table, create_publication_for_table,
-    discover_table_schema, execute_clickhouse_query, read_snapshot_rows_batch,
-    read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
+    count_clickhouse_rows, create_clickhouse_snapshot_table, create_logical_replication_slot,
+    create_publication_for_table, discover_table_schema, execute_clickhouse_query,
+    read_snapshot_rows_batch, read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
     read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
 };
 use tokio_postgres::{Client, Error, NoTls};
@@ -659,6 +659,43 @@ async fn creates_publication_for_table() -> anyhow::Result<()> {
 
     let drop_table_sql = format!("DROP TABLE {}", table_name);
     client.execute(&drop_table_sql, &[]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn creates_logical_replication_slot() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+    let slot_name = unique_table_name();
+
+    create_logical_replication_slot(&client, &slot_name).await?;
+
+    let rows = client
+        .query(
+            "
+            SELECT slot_name, plugin, slot_type
+            FROM pg_replication_slots
+            WHERE slot_name = $1
+            ",
+            &[&slot_name],
+        )
+        .await?;
+
+    assert_eq!(rows.len(), 1);
+
+    let plugin: String = rows[0].get("plugin");
+    let slot_type: String = rows[0].get("slot_type");
+
+    assert_eq!(plugin, "pgoutput");
+    assert_eq!(slot_type, "logical");
+
+    let drop_slot_sql = "
+        SELECT pg_drop_replication_slot(slot_name)
+        FROM pg_replication_slots
+        WHERE slot_name = $1
+    ";
+
+    client.execute(drop_slot_sql, &[&slot_name]).await?;
 
     Ok(())
 }
