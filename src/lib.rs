@@ -686,6 +686,44 @@ pub async fn execute_clickhouse_query(
     Ok(())
 }
 
+pub async fn fetch_clickhouse_query(
+    config: &ClickHouseConfig,
+    query: &str,
+) -> anyhow::Result<String> {
+    let response = reqwest::Client::new()
+        .post(&config.url)
+        .query(&[("database", &config.database)])
+        .basic_auth(&config.user, Some(&config.password))
+        .body(query.to_string())
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        anyhow::bail!("ClickHouse query failed with status {}: {}", status, body);
+    }
+
+    Ok(body)
+}
+
+pub async fn count_clickhouse_rows(
+    config: &ClickHouseConfig,
+    table_name: &str,
+) -> anyhow::Result<u64> {
+    let query = format!(
+        "SELECT count(*) FROM {}",
+        quote_clickhouse_identifier(table_name)
+    );
+
+    let body = fetch_clickhouse_query(config, &query).await?;
+
+    let count = body.trim().parse::<u64>()?;
+
+    Ok(count)
+}
+
 pub async fn create_clickhouse_snapshot_table(
     config: &ClickHouseConfig,
     schema: &TableSchema,

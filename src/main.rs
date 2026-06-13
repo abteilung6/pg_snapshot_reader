@@ -4,9 +4,9 @@ use std::path::Path;
 use tokio_postgres::NoTls;
 
 use pg_snapshot_reader::{
-    ClickHouseConfig, ClickHouseSnapshotRowWriter, create_clickhouse_snapshot_table,
-    discover_table_schema, read_snapshot_rows_full_with_stage_and_checkpoint,
-    write_staged_snapshot_rows,
+    ClickHouseConfig, ClickHouseSnapshotRowWriter, count_clickhouse_rows,
+    create_clickhouse_snapshot_table, discover_table_schema,
+    read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
 };
 
 #[tokio::main]
@@ -73,6 +73,18 @@ async fn main() -> anyhow::Result<()> {
     };
 
     write_staged_snapshot_rows(stage_path, &writer).await?;
+
+    let clickhouse_row_count = count_clickhouse_rows(&writer.config, "users_snapshot").await?;
+
+    println!("clickhouse rows written: {}", clickhouse_row_count);
+
+    if clickhouse_row_count != rows.len() as u64 {
+        anyhow::bail!(
+            "row count mismatch: snapshot read {} rows but ClickHouse has {} rows",
+            rows.len(),
+            clickhouse_row_count
+        );
+    }
 
     Ok(())
 }
