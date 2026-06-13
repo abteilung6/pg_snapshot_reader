@@ -3,7 +3,7 @@ use std::path::Path;
 use tokio_postgres::NoTls;
 
 use pg_snapshot_reader::{
-    ClickHouseConfig, DebugSnapshotRowWriter, create_clickhouse_snapshot_table,
+    ClickHouseConfig, ClickHouseSnapshotRowWriter, create_clickhouse_snapshot_table,
     discover_table_schema, read_snapshot_rows_full_with_stage_and_checkpoint,
     write_staged_snapshot_rows,
 };
@@ -50,7 +50,10 @@ async fn main() -> anyhow::Result<()> {
     println!("stage written to: {}", stage_path.display());
     println!("checkpoint written to: {}", checkpoint_path.display());
 
-    let writer = DebugSnapshotRowWriter;
+    let writer = ClickHouseSnapshotRowWriter {
+        config: clickhouse_config,
+        table_name: "users_snapshot".to_string(),
+    };
 
     write_staged_snapshot_rows(stage_path, &writer).await?;
 

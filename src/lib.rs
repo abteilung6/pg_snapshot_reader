@@ -50,6 +50,26 @@ impl SnapshotRowWriter for DebugSnapshotRowWriter {
     }
 }
 
+pub struct ClickHouseSnapshotRowWriter {
+    pub config: ClickHouseConfig,
+    pub table_name: String,
+}
+
+#[async_trait]
+impl SnapshotRowWriter for ClickHouseSnapshotRowWriter {
+    async fn write_rows(&self, rows: &[SnapshotRow]) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let query = build_clickhouse_insert_query(&self.table_name, rows)?;
+
+        execute_clickhouse_query(&self.config, &query).await?;
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotCheckpoint {
     pub table_name: String,
@@ -448,6 +468,62 @@ pub fn build_clickhouse_create_snapshot_table_query(
     )
 }
 
+pub fn build_clickhouse_insert_query(
+    table_name: &str,
+    rows: &[SnapshotRow],
+) -> anyhow::Result<String> {
+    if rows.is_empty() {
+        return Ok(String::new());
+    }
+
+    let first_row = &rows[0];
+
+    let mut column_names = first_row.values.keys().cloned().collect::<Vec<String>>();
+
+    column_names.sort();
+
+    let columns_sql = column_names
+        .iter()
+        .map(|name| quote_clickhouse_identifier(name))
+        .collect::<Vec<String>>()
+        .join(", ");
+
+    let mut values_sql = Vec::new();
+
+    for row in rows {
+        let mut row_values = Vec::new();
+
+        for column_name in &column_names {
+            let value = row
+                .values
+                .get(column_name)
+                .ok_or_else(|| anyhow::anyhow!("missing column '{}'", column_name))?;
+
+            let value_sql = match value {
+                SnapshotValue::String(value) => {
+                    format!("'{}'", escape_clickhouse_string(value))
+                }
+                SnapshotValue::Null => "NULL".to_string(),
+            };
+
+            row_values.push(value_sql);
+        }
+
+        values_sql.push(format!("({})", row_values.join(", ")));
+    }
+
+    Ok(format!(
+        "INSERT INTO {} ({}) VALUES\n{}",
+        quote_clickhouse_identifier(table_name),
+        columns_sql,
+        values_sql.join(",\n")
+    ))
+}
+
+fn escape_clickhouse_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
 fn quote_clickhouse_identifier(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
@@ -724,5 +800,37 @@ mod tests {
         assert!(query.contains("`email` String"));
         assert!(query.contains("ENGINE = MergeTree"));
         assert!(query.contains("ORDER BY `id`"));
+    }
+
+    #[test]
+    fn builds_clickhouse_insert_query() {
+        let mut first_values = HashMap::new();
+        first_values.insert("id".to_string(), SnapshotValue::String("1".to_string()));
+        first_values.insert(
+            "name".to_string(),
+            SnapshotValue::String("Alice".to_string()),
+        );
+
+        let mut second_values = HashMap::new();
+        second_values.insert("id".to_string(), SnapshotValue::String("2".to_string()));
+        second_values.insert("name".to_string(), SnapshotValue::String("Bob".to_string()));
+
+        let rows = vec![
+            SnapshotRow {
+                values: first_values,
+            },
+            SnapshotRow {
+                values: second_values,
+            },
+        ];
+
+        let query = build_clickhouse_insert_query("users_snapshot", &rows).unwrap();
+
+        assert!(query.contains("INSERT INTO `users_snapshot`"));
+        assert!(query.contains("`id`, `name`"));
+        assert!(query.contains("'1'"));
+        assert!(query.contains("'Alice'"));
+        assert!(query.contains("'2'"));
+        assert!(query.contains("'Bob'"));
     }
 }
