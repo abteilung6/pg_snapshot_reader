@@ -91,6 +91,13 @@ pub struct SnapshotBoundary {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostgresCdcPrerequisites {
+    pub wal_level: String,
+    pub max_replication_slots: i32,
+    pub max_wal_senders: i32,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -297,6 +304,24 @@ pub async fn create_logical_replication_slot(
     client.query(create_query, &[&slot_name]).await?;
 
     Ok(())
+}
+
+pub async fn check_postgres_cdc_prerequisites(
+    client: &Client,
+) -> Result<PostgresCdcPrerequisites, Error> {
+    let wal_level_row = client.query_one("SHOW wal_level", &[]).await?;
+    let max_replication_slots_row = client.query_one("SHOW max_replication_slots", &[]).await?;
+    let max_wal_senders_row = client.query_one("SHOW max_wal_senders", &[]).await?;
+
+    let wal_level: String = wal_level_row.get(0);
+    let max_replication_slots: String = max_replication_slots_row.get(0);
+    let max_wal_senders: String = max_wal_senders_row.get(0);
+
+    Ok(PostgresCdcPrerequisites {
+        wal_level,
+        max_replication_slots: max_replication_slots.parse::<i32>().unwrap(),
+        max_wal_senders: max_wal_senders.parse::<i32>().unwrap(),
+    })
 }
 
 fn quote_postgres_identifier(identifier: &str) -> String {

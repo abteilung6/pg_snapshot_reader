@@ -3,10 +3,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pg_snapshot_reader::{
     ClickHouseConfig, ClickHouseSnapshotRowWriter, SnapshotCheckpoint, SnapshotValue,
-    count_clickhouse_rows, create_clickhouse_snapshot_table, create_logical_replication_slot,
-    create_publication_for_table, discover_table_schema, execute_clickhouse_query,
-    read_snapshot_rows_batch, read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
-    read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
+    check_postgres_cdc_prerequisites, count_clickhouse_rows, create_clickhouse_snapshot_table,
+    create_logical_replication_slot, create_publication_for_table, discover_table_schema,
+    execute_clickhouse_query, read_snapshot_rows_batch, read_snapshot_rows_full,
+    read_snapshot_rows_full_with_checkpoint, read_snapshot_rows_full_with_stage_and_checkpoint,
+    write_staged_snapshot_rows,
 };
 use tokio_postgres::{Client, Error, NoTls};
 
@@ -696,6 +697,19 @@ async fn creates_logical_replication_slot() -> anyhow::Result<()> {
     ";
 
     client.execute(drop_slot_sql, &[&slot_name]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn checks_postgres_cdc_prerequisites() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+
+    let prerequisites = check_postgres_cdc_prerequisites(&client).await?;
+
+    assert_eq!(prerequisites.wal_level, "logical");
+    assert!(prerequisites.max_replication_slots > 0);
+    assert!(prerequisites.max_wal_senders > 0);
 
     Ok(())
 }
