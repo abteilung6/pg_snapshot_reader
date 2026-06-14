@@ -98,6 +98,13 @@ pub struct PostgresCdcPrerequisites {
     pub max_wal_senders: i32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedWalChange {
+    pub lsn: String,
+    pub xid: String,
+    pub data: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -288,6 +295,14 @@ pub async fn create_logical_replication_slot(
     client: &Client,
     slot_name: &str,
 ) -> Result<(), Error> {
+    create_logical_replication_slot_with_plugin(client, slot_name, "pgoutput").await
+}
+
+pub async fn create_logical_replication_slot_with_plugin(
+    client: &Client,
+    slot_name: &str,
+    plugin: &str,
+) -> Result<(), Error> {
     let drop_query = "
         SELECT pg_drop_replication_slot(slot_name)
         FROM pg_replication_slots
@@ -298,12 +313,40 @@ pub async fn create_logical_replication_slot(
 
     let create_query = "
         SELECT *
-        FROM pg_create_logical_replication_slot($1, 'pgoutput')
+        FROM pg_create_logical_replication_slot($1, $2)
     ";
 
-    client.query(create_query, &[&slot_name]).await?;
+    client.query(create_query, &[&slot_name, &plugin]).await?;
 
     Ok(())
+}
+
+pub async fn read_decoded_wal_changes(
+    client: &Client,
+    slot_name: &str,
+    limit: i32,
+) -> Result<Vec<DecodedWalChange>, Error> {
+    let rows = client
+        .query(
+            "
+            SELECT lsn::text AS lsn, xid::text AS xid, data
+            FROM pg_logical_slot_get_changes($1, NULL, $2)
+            ",
+            &[&slot_name, &limit],
+        )
+        .await?;
+
+    let mut changes = Vec::new();
+
+    for row in rows {
+        let lsn: String = row.get("lsn");
+        let xid: String = row.get("xid");
+        let data: String = row.get("data");
+
+        changes.push(DecodedWalChange { lsn, xid, data });
+    }
+
+    Ok(changes)
 }
 
 pub async fn check_postgres_cdc_prerequisites(

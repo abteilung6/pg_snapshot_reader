@@ -4,8 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use pg_snapshot_reader::{
     ClickHouseConfig, ClickHouseSnapshotRowWriter, SnapshotCheckpoint, SnapshotValue,
     check_postgres_cdc_prerequisites, count_clickhouse_rows, create_clickhouse_snapshot_table,
-    create_logical_replication_slot, create_publication_for_table, discover_table_schema,
-    execute_clickhouse_query, read_snapshot_rows_batch, read_snapshot_rows_full,
+    create_logical_replication_slot, create_logical_replication_slot_with_plugin,
+    create_publication_for_table, discover_table_schema, execute_clickhouse_query,
+    read_decoded_wal_changes, read_snapshot_rows_batch, read_snapshot_rows_full,
     read_snapshot_rows_full_with_checkpoint, read_snapshot_rows_full_with_stage_and_checkpoint,
     write_staged_snapshot_rows,
 };
@@ -710,6 +711,56 @@ async fn checks_postgres_cdc_prerequisites() -> anyhow::Result<()> {
     assert_eq!(prerequisites.wal_level, "logical");
     assert!(prerequisites.max_replication_slots > 0);
     assert!(prerequisites.max_wal_senders > 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn reads_decoded_wal_changes_with_test_decoding() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+    let table_name = unique_table_name();
+    let slot_name = format!("{}_slot", table_name);
+
+    create_logical_replication_slot_with_plugin(&client, &slot_name, "test_decoding").await?;
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_table_sql, &[]).await?;
+
+    let insert_sql = format!(
+        "
+        INSERT INTO {} (name)
+        VALUES ('Alice')
+        ",
+        table_name
+    );
+
+    client.execute(&insert_sql, &[]).await?;
+
+    let changes = read_decoded_wal_changes(&client, &slot_name, 10).await?;
+
+    assert!(changes.iter().any(|change| change.data.contains("INSERT")));
+
+    assert!(changes.iter().any(|change| change.data.contains("Alice")));
+
+    let drop_slot_sql = "
+        SELECT pg_drop_replication_slot(slot_name)
+        FROM pg_replication_slots
+        WHERE slot_name = $1
+    ";
+
+    client.execute(drop_slot_sql, &[&slot_name]).await?;
+
+    let drop_table_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_table_sql, &[]).await?;
 
     Ok(())
 }
