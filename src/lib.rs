@@ -1247,6 +1247,33 @@ pub fn create_cdc_stage_batch_paths(stage_dir: &Path, batch_id: &str) -> CdcStag
     }
 }
 
+pub fn write_cdc_stage_batch(
+    stage_dir: &Path,
+    slot_name: &str,
+    events: &[CdcEvent],
+) -> anyhow::Result<Option<CdcStageBatchMetadata>> {
+    let Some(first_event) = events.first() else {
+        return Ok(None);
+    };
+
+    let Some(last_event) = events.last() else {
+        return Ok(None);
+    };
+
+    let batch_id = create_cdc_stage_batch_id(slot_name, &first_event.lsn, &last_event.lsn);
+
+    let paths = create_cdc_stage_batch_paths(stage_dir, &batch_id);
+
+    write_cdc_events_jsonl_atomic(&paths.events_path, events)?;
+
+    let metadata = create_cdc_stage_batch_metadata(slot_name, &paths.events_path, events)
+        .expect("expected metadata for non-empty CDC events");
+
+    save_cdc_stage_batch_metadata(&paths.metadata_path, &metadata)?;
+
+    Ok(Some(metadata))
+}
+
 pub async fn execute_clickhouse_query(
     config: &ClickHouseConfig,
     query: &str,
@@ -2208,5 +2235,95 @@ mod tests {
             paths.metadata_path,
             Path::new("cdc_stage").join("test_slot_0_100_0_150.meta.json")
         );
+    }
+
+    #[test]
+    fn writes_cdc_stage_batch_with_events_and_metadata() -> anyhow::Result<()> {
+        let stage_dir = std::env::temp_dir().join("pg_snapshot_reader_write_cdc_stage_batch_test");
+
+        if stage_dir.exists() {
+            std::fs::remove_dir_all(&stage_dir)?;
+        }
+
+        std::fs::create_dir_all(&stage_dir)?;
+
+        let events = vec![
+            CdcEvent {
+                lsn: "0/100".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Begin,
+                table_name: None,
+                column_values: HashMap::new(),
+                raw_data: "BEGIN 1".to_string(),
+            },
+            CdcEvent {
+                lsn: "0/120".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Insert,
+                table_name: Some("public.users".to_string()),
+                column_values: HashMap::from([(
+                    "id".to_string(),
+                    SnapshotValue::String("1".to_string()),
+                )]),
+                raw_data: "table public.users: INSERT: id[integer]:1".to_string(),
+            },
+            CdcEvent {
+                lsn: "0/150".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Commit,
+                table_name: None,
+                column_values: HashMap::new(),
+                raw_data: "COMMIT 1".to_string(),
+            },
+        ];
+
+        let metadata =
+            write_cdc_stage_batch(&stage_dir, "test_slot", &events)?.expect("expected metadata");
+
+        assert_eq!(metadata.batch_id, "test_slot_0_100_0_150");
+        assert_eq!(metadata.slot_name, "test_slot");
+        assert_eq!(metadata.start_lsn, "0/100");
+        assert_eq!(metadata.end_lsn, "0/150");
+        assert_eq!(metadata.event_count, 3);
+        assert_eq!(metadata.status, CdcStageBatchStatus::Pending);
+
+        let paths = create_cdc_stage_batch_paths(&stage_dir, &metadata.batch_id);
+
+        assert!(paths.events_path.exists());
+        assert!(paths.metadata_path.exists());
+
+        let loaded_metadata =
+            load_cdc_stage_batch_metadata(&paths.metadata_path)?.expect("expected metadata");
+
+        assert_eq!(loaded_metadata, metadata);
+
+        let loaded_events = read_cdc_events_jsonl(&paths.events_path)?;
+
+        assert_eq!(loaded_events, events);
+
+        std::fs::remove_dir_all(&stage_dir)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn does_not_write_cdc_stage_batch_for_empty_events() -> anyhow::Result<()> {
+        let stage_dir = std::env::temp_dir().join("pg_snapshot_reader_empty_cdc_stage_batch_test");
+
+        if stage_dir.exists() {
+            std::fs::remove_dir_all(&stage_dir)?;
+        }
+
+        std::fs::create_dir_all(&stage_dir)?;
+
+        let metadata = write_cdc_stage_batch(&stage_dir, "test_slot", &[])?;
+
+        assert_eq!(metadata, None);
+
+        assert_eq!(std::fs::read_dir(&stage_dir)?.count(), 0);
+
+        std::fs::remove_dir_all(&stage_dir)?;
+
+        Ok(())
     }
 }
