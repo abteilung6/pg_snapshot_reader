@@ -1023,7 +1023,7 @@ pub async fn read_decoded_wal_changes_into_stage(
     let changes = read_decoded_wal_changes(client, slot_name, limit).await?;
     let events = parse_decoded_wal_changes(changes);
 
-    write_cdc_events_jsonl(events_path, &events)?;
+    write_cdc_events_jsonl_atomic(events_path, &events)?;
 
     if let Some(metadata) = create_cdc_stage_batch_metadata(slot_name, events_path, &events) {
         save_cdc_stage_batch_metadata(metadata_path, &metadata)?;
@@ -1072,6 +1072,24 @@ pub fn create_cdc_stage_batch_metadata(
         event_count: events.len(),
         events_path: events_path.to_string_lossy().to_string(),
     })
+}
+
+pub fn write_cdc_events_jsonl_atomic(path: &Path, events: &[CdcEvent]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temp_path = path.with_extension("jsonl.tmp");
+
+    if temp_path.exists() {
+        fs::remove_file(&temp_path)?;
+    }
+
+    write_cdc_events_jsonl(&temp_path, events)?;
+
+    fs::rename(&temp_path, path)?;
+
+    Ok(())
 }
 
 pub async fn execute_clickhouse_query(
@@ -1579,6 +1597,46 @@ mod tests {
         let loaded = load_cdc_stage_batch_metadata(&path)?;
 
         assert_eq!(loaded, Some(metadata));
+
+        std::fs::remove_file(&path)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn writes_cdc_events_jsonl_atomically() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join("pg_snapshot_reader_cdc_events_atomic_test.jsonl");
+
+        let temp_path = path.with_extension("jsonl.tmp");
+
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+
+        if temp_path.exists() {
+            std::fs::remove_file(&temp_path)?;
+        }
+
+        let event = CdcEvent {
+            lsn: "0/100".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Insert,
+            table_name: Some("public.users".to_string()),
+            column_values: HashMap::from([(
+                "id".to_string(),
+                SnapshotValue::String("1".to_string()),
+            )]),
+            raw_data: "table public.users: INSERT: id[integer]:1".to_string(),
+        };
+
+        write_cdc_events_jsonl_atomic(&path, &[event.clone()])?;
+
+        assert!(path.exists());
+        assert!(!temp_path.exists());
+
+        let events = read_cdc_events_jsonl(&path)?;
+
+        assert_eq!(events, vec![event]);
 
         std::fs::remove_file(&path)?;
 
