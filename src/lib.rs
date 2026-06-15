@@ -121,6 +121,7 @@ pub struct CdcEvent {
     pub xid: String,
     pub kind: CdcEventKind,
     pub table_name: Option<String>,
+    pub column_values: HashMap<String, SnapshotValue>,
     pub raw_data: String,
 }
 
@@ -406,12 +407,18 @@ pub fn parse_decoded_wal_change(change: DecodedWalChange) -> CdcEvent {
     };
 
     let table_name = extract_table_name_from_decoded_change(&change.data);
+    let column_values = if kind == CdcEventKind::Insert {
+        extract_insert_column_values_from_decoded_change(&change.data)
+    } else {
+        HashMap::new()
+    };
 
     CdcEvent {
         lsn: change.lsn,
         xid: change.xid,
         kind,
         table_name,
+        column_values,
         raw_data: change.data,
     }
 }
@@ -425,6 +432,35 @@ pub fn extract_table_name_from_decoded_change(data: &str) -> Option<String> {
     }
 
     Some(table_name.to_string())
+}
+
+pub fn extract_insert_column_values_from_decoded_change(
+    data: &str,
+) -> HashMap<String, SnapshotValue> {
+    let mut values = HashMap::new();
+
+    let Some((_prefix, columns_part)) = data.split_once(": INSERT:") else {
+        return values;
+    };
+
+    for column_part in columns_part.trim().split(' ') {
+        let Some((column_with_type, raw_value)) = column_part.split_once(':') else {
+            continue;
+        };
+
+        let Some((column_name, _type_part)) = column_with_type.split_once('[') else {
+            continue;
+        };
+
+        let value = raw_value.trim_matches('\'');
+
+        values.insert(
+            column_name.to_string(),
+            SnapshotValue::String(value.to_string()),
+        );
+    }
+
+    values
 }
 
 pub fn parse_decoded_wal_changes(changes: Vec<DecodedWalChange>) -> Vec<CdcEvent> {
@@ -1263,6 +1299,17 @@ mod tests {
         let event = parse_decoded_wal_change(change);
 
         assert_eq!(event.kind, CdcEventKind::Insert);
+        assert_eq!(event.table_name, Some("public.users".to_string()));
+
+        assert_eq!(
+            event.column_values.get("id"),
+            Some(&SnapshotValue::String("1".to_string()))
+        );
+
+        assert_eq!(
+            event.column_values.get("name"),
+            Some(&SnapshotValue::String("Alice".to_string()))
+        );
     }
 
     #[test]
@@ -1306,5 +1353,22 @@ mod tests {
         let table_name = extract_table_name_from_decoded_change("BEGIN 123");
 
         assert_eq!(table_name, None);
+    }
+
+    #[test]
+    fn extracts_column_values_from_decoded_insert_change() {
+        let values = extract_insert_column_values_from_decoded_change(
+            "table public.users: INSERT: id[integer]:1 name[text]:'Alice'",
+        );
+
+        assert_eq!(
+            values.get("id"),
+            Some(&SnapshotValue::String("1".to_string()))
+        );
+
+        assert_eq!(
+            values.get("name"),
+            Some(&SnapshotValue::String("Alice".to_string()))
+        );
     }
 }
