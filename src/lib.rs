@@ -1053,19 +1053,12 @@ pub async fn read_decoded_wal_changes_into_stage(
     client: &Client,
     slot_name: &str,
     limit: i32,
-    events_path: &Path,
-    metadata_path: &Path,
-) -> anyhow::Result<Vec<CdcEvent>> {
+    stage_dir: &Path,
+) -> anyhow::Result<Option<CdcStageBatchMetadata>> {
     let changes = read_decoded_wal_changes(client, slot_name, limit).await?;
     let events = parse_decoded_wal_changes(changes);
 
-    write_cdc_events_jsonl_atomic(events_path, &events)?;
-
-    if let Some(metadata) = create_cdc_stage_batch_metadata(slot_name, events_path, &events) {
-        save_cdc_stage_batch_metadata(metadata_path, &metadata)?;
-    }
-
-    Ok(events)
+    write_cdc_stage_batch(stage_dir, slot_name, &events)
 }
 
 pub fn save_cdc_stage_batch_metadata(

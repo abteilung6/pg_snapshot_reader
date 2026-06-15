@@ -2,14 +2,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pg_snapshot_reader::{
-    CdcEventKind, ClickHouseConfig, ClickHouseSnapshotRowWriter, SnapshotCheckpoint, SnapshotValue,
-    check_postgres_cdc_prerequisites, count_clickhouse_rows, create_clickhouse_snapshot_table,
+    CdcEventKind, CdcStageBatchStatus, ClickHouseConfig, ClickHouseSnapshotRowWriter,
+    SnapshotCheckpoint, SnapshotValue, check_postgres_cdc_prerequisites, count_clickhouse_rows,
+    create_cdc_stage_batch_paths, create_clickhouse_snapshot_table,
     create_logical_replication_slot, create_logical_replication_slot_with_plugin,
     create_publication_for_table, discover_table_schema, execute_clickhouse_query,
-    load_cdc_stage_batch_metadata, parse_decoded_wal_changes, read_cdc_events_jsonl,
-    read_decoded_wal_changes, read_decoded_wal_changes_into_stage, read_snapshot_rows_batch,
-    read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
-    read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
+    load_cdc_stage_batch_metadata, parse_decoded_wal_changes, read_decoded_wal_changes,
+    read_decoded_wal_changes_into_stage, read_snapshot_rows_batch, read_snapshot_rows_full,
+    read_snapshot_rows_full_with_checkpoint, read_snapshot_rows_full_with_stage_and_checkpoint,
+    validate_cdc_stage_batch, write_staged_snapshot_rows,
 };
 use tokio_postgres::{Client, Error, NoTls};
 
@@ -776,11 +777,13 @@ async fn reads_decoded_wal_changes_into_cdc_stage() -> anyhow::Result<()> {
     let client = connect_to_postgres().await?;
     let table_name = unique_table_name();
     let slot_name = format!("{}_slot", table_name);
-    let stage_path = std::env::temp_dir().join(format!("{}_cdc_events.jsonl", table_name));
+    let stage_dir = std::env::temp_dir().join(format!("{}_cdc_stage", table_name));
 
-    if stage_path.exists() {
-        std::fs::remove_file(&stage_path)?;
+    if stage_dir.exists() {
+        std::fs::remove_dir_all(&stage_dir)?;
     }
+
+    std::fs::create_dir_all(&stage_dir)?;
 
     create_logical_replication_slot_with_plugin(&client, &slot_name, "test_decoding").await?;
 
@@ -804,25 +807,39 @@ async fn reads_decoded_wal_changes_into_cdc_stage() -> anyhow::Result<()> {
     );
     client.execute(&insert_sql, &[]).await?;
 
-    let metadata_path = std::env::temp_dir().join(format!("{}_cdc_events.meta.json", table_name));
+    let metadata = read_decoded_wal_changes_into_stage(&client, &slot_name, 1000, &stage_dir)
+        .await?
+        .expect("expected CDC stage batch metadata");
 
-    if metadata_path.exists() {
-        std::fs::remove_file(&metadata_path)?;
-    }
+    let paths = create_cdc_stage_batch_paths(&stage_dir, &metadata.batch_id);
 
-    let events =
-        read_decoded_wal_changes_into_stage(&client, &slot_name, 10, &stage_path, &metadata_path)
-            .await?;
+    assert!(paths.events_path.exists());
+    assert!(paths.metadata_path.exists());
 
-    assert!(
-        events
-            .iter()
-            .any(|event| event.kind == CdcEventKind::Insert)
+    let loaded_metadata =
+        load_cdc_stage_batch_metadata(&paths.metadata_path)?.expect("expected CDC stage metadata");
+
+    assert_eq!(loaded_metadata, metadata);
+
+    let staged_events = validate_cdc_stage_batch(&metadata)?;
+
+    assert_eq!(metadata.slot_name, slot_name);
+    assert_eq!(metadata.event_count, staged_events.len());
+    assert_eq!(metadata.status, CdcStageBatchStatus::Pending);
+    assert_eq!(
+        metadata.events_path,
+        paths.events_path.to_string_lossy().to_string()
     );
 
-    let staged_events = read_cdc_events_jsonl(&stage_path)?;
+    assert_eq!(
+        metadata.start_lsn,
+        staged_events.first().expect("expected first event").lsn
+    );
 
-    assert_eq!(staged_events, events);
+    assert_eq!(
+        metadata.end_lsn,
+        staged_events.last().expect("expected last event").lsn
+    );
 
     let expected_table_name = format!("public.{}", table_name);
 
@@ -832,25 +849,11 @@ async fn reads_decoded_wal_changes_into_cdc_stage() -> anyhow::Result<()> {
             .any(|event| event.table_name.as_deref() == Some(expected_table_name.as_str()))
     );
 
-    let metadata =
-        load_cdc_stage_batch_metadata(&metadata_path)?.expect("expected CDC stage metadata");
-
-    assert_eq!(metadata.slot_name, slot_name);
-    assert_eq!(metadata.event_count, events.len());
-    assert_eq!(
-        metadata.events_path,
-        stage_path.to_string_lossy().to_string()
-    );
-
-    assert_eq!(
-        metadata.start_lsn,
-        events.first().expect("expected first event").lsn
-    );
-
-    assert_eq!(
-        metadata.end_lsn,
-        events.last().expect("expected last event").lsn
-    );
+    assert!(staged_events.iter().any(|event| {
+        event.kind == CdcEventKind::Insert
+            && event.table_name.as_deref() == Some(expected_table_name.as_str())
+            && event.column_values.get("name") == Some(&SnapshotValue::String("Alice".to_string()))
+    }));
 
     let drop_slot_sql = "
         SELECT pg_drop_replication_slot(slot_name)
@@ -862,12 +865,8 @@ async fn reads_decoded_wal_changes_into_cdc_stage() -> anyhow::Result<()> {
     let drop_table_sql = format!("DROP TABLE {}", table_name);
     client.execute(&drop_table_sql, &[]).await?;
 
-    if stage_path.exists() {
-        std::fs::remove_file(&stage_path)?;
-    }
-
-    if metadata_path.exists() {
-        std::fs::remove_file(&metadata_path)?;
+    if stage_dir.exists() {
+        std::fs::remove_dir_all(&stage_dir)?;
     }
 
     Ok(())
