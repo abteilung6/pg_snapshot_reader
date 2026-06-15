@@ -280,7 +280,11 @@ Do not switch too early. The system should first be easy to inspect.
 
 ## Durable Stage
 
-A stage is not just a temporary file. It is a pressure boundary.
+A stage is not just a temporary file. It is a pressure boundary and an ownership-transfer boundary.
+
+Before a change is staged, Postgres WAL is still the only durable copy of that change for the consumer. After a change is durably staged, the replication system owns a replayable copy of the change.
+
+This is why LSN acknowledgement must be tied to durable staging.
 
 Without a stage:
 
@@ -472,6 +476,47 @@ retention policy
 
 For a serious system, this state is not optional. It is the control surface of CDC.
 
+## WAL Retention Policy
+
+A logical replication slot protects the CDC consumer by forcing Postgres to retain WAL until the consumer has acknowledged progress.
+
+This creates an operational policy trade-off.
+
+With unlimited slot WAL retention, the system favors CDC continuity:
+
+```text
+replication slot can fall behind
+Postgres keeps the required WAL
+consumer may still catch up later
+risk: unbounded source storage pressure
+```
+
+With bounded slot WAL retention, the system favors source availability:
+
+```text
+Postgres limits WAL retained for the slot
+a severely lagging slot may become unusable
+consumer may need to recreate the slot
+pipeline may need full or partial resync
+```
+
+This is not ordinary source data loss. The source table data still exists in Postgres. What is lost is the continuous change history needed by that replication slot.
+
+The replication system should treat this as an explicit policy:
+
+```text
+unlimited WAL retention:
+  prioritize CDC continuity
+  accept source storage risk
+
+bounded WAL retention:
+  prioritize source database availability
+  accept resync when lag exceeds the budget
+```
+
+The durable stage reduces the chance that target slowness turns into slot lag, but it does not remove backpressure. It moves the pressure from Postgres WAL retention into the replication system’s own staged backlog and retention policy.
+
+
 ## TOAST and Missing Values
 
 CDC events are not always full rows.
@@ -584,43 +629,126 @@ WAL retention
 
 Without observability, performance tuning is folklore.
 
-## Later Roadmap
+## Roadmap From Current State
 
-After the first end-to-end example, optimizations should be layered in this order.
-
-### 1. Larger and Safer Batches
+The first end-to-end snapshot path now exists:
 
 ```text
-increase batch size
-write batch metadata
-validate row counts per batch
-make stage writes atomic
-avoid rewriting already-applied stage data
+Postgres snapshot
+  -> local JSONL stage
+  -> ClickHouse
 ```
 
-### 2. Better ClickHouse Writes
+The first CDC-to-stage path also exists:
 
 ```text
-use JSONEachRow consistently
-use compression
-avoid tiny inserts
-measure insert throughput
-test RowBinary or Native format
+Postgres WAL
+  -> decoded WAL changes
+  -> internal CDC events
+  -> local JSONL stage
 ```
 
-### 3. Stable Snapshot Boundary
+The next optimization work should not start with throughput. It should start by making the stage a real durable progress boundary.
+
+### 1. Durable CDC Batch Metadata
+
+```text
+batch_id
+slot_name
+table_name
+start_lsn
+end_lsn
+event_count
+events_path
+created_at
+stage_write_completed
+```
+
+This turns CDC staging from “a JSONL file” into a replayable replication unit.
+
+The source-facing rule becomes:
+
+```text
+read WAL
+-> write LSN-bounded CDC batch
+-> persist batch metadata
+-> acknowledge source progress up to batch end_lsn
+```
+
+### 2. Atomic Stage Writes
+
+```text
+write batch to temporary file
+fsync or otherwise ensure durability
+rename into final batch path
+write metadata after data is complete
+avoid partially visible batches
+```
+
+A stage is only a safety boundary if staged data is not partially written or ambiguous after a crash.
+
+### 3. Target Delivery State
+
+```text
+pending
+writing
+written
+failed
+retry_count
+last_error
+target_written_at
+```
+
+This separates source progress from target delivery.
+
+A slow ClickHouse writer should increase stage backlog, not immediately increase Postgres replication-slot lag.
+
+### 4. Stable Snapshot Boundary
 
 ```text
 repeatable-read transaction
 exported snapshot
 snapshot boundary tracking
-prepare CDC handoff
+replication slot coordination
+snapshot-to-CDC handoff LSN
 ```
 
-### 4. Partitioned Snapshot
+The snapshot and CDC stream must form one continuous source history.
+
+### 5. CDC Apply Model for ClickHouse
 
 ```text
-min/max ranges
+insert -> append row
+update -> append newer version
+delete -> append tombstone
+```
+
+Future ClickHouse tables should include internal replication columns:
+
+```text
+_source_lsn
+_replication_batch_id
+_replication_version
+_replication_deleted
+_replication_synced_at
+```
+
+### 6. Better ClickHouse Writes
+
+```text
+larger JSONEachRow batches
+compressed HTTP inserts
+avoid tiny inserts
+measure insert throughput
+evaluate RowBinary, Native format, or staged Parquet
+```
+
+This should come after the stage can track replayable batches.
+
+### 7. Partitioned Snapshot
+
+```text
+min/max primary-key ranges
 NTILE ranges
 CTID ranges
 multiple workers
@@ -628,30 +756,21 @@ per-partition checkpoint
 per-partition retry
 ```
 
-### 5. CDC
+Parallel snapshot reads are only safe once consistent snapshot semantics are understood.
+
+### 8. Production Logical Replication Reader
 
 ```text
-publication
-replication slot
-WAL stream
-INSERT/UPDATE/DELETE decoding
-LSN checkpoint
-durable CDC stage
-standby status updates
+move beyond test_decoding
+evaluate pgoutput or replication protocol streaming
+send standby status updates
+persist confirmed LSN progress
+handle slot lag
+handle lost slots
+define resync policy
 ```
 
-### 6. Append-Oriented CDC Target
-
-```text
-version column
-delete marker
-source LSN column
-ReplacingMergeTree
-latest-state validation
-idempotent replay
-```
-
-### 7. Advanced CDC Correctness
+### 9. Advanced CDC Correctness
 
 ```text
 schema evolution
@@ -659,6 +778,7 @@ large values
 unchanged TOAST columns
 transaction ordering
 crash recovery
-retention policy
+stage retention policy
 replication lag alerts
+idempotent replay
 ```
