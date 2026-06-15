@@ -1281,6 +1281,63 @@ pub fn read_cdc_stage_batch(metadata_path: &Path) -> anyhow::Result<CdcStageBatc
     Ok(CdcStageBatch { metadata, events })
 }
 
+pub fn list_cdc_stage_batch_metadata(
+    stage_dir: &Path,
+) -> anyhow::Result<Vec<CdcStageBatchMetadata>> {
+    if !stage_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut metadata = Vec::new();
+
+    for entry in fs::read_dir(stage_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        if !file_name.ends_with(".meta.json") {
+            continue;
+        }
+
+        let Some(batch_metadata) = load_cdc_stage_batch_metadata(&path)? else {
+            continue;
+        };
+
+        metadata.push(batch_metadata);
+    }
+
+    metadata.sort_by(|left, right| {
+        left.start_lsn
+            .cmp(&right.start_lsn)
+            .then_with(|| left.batch_id.cmp(&right.batch_id))
+    });
+
+    Ok(metadata)
+}
+
+pub fn list_deliverable_cdc_stage_batch_metadata(
+    stage_dir: &Path,
+) -> anyhow::Result<Vec<CdcStageBatchMetadata>> {
+    let metadata = list_cdc_stage_batch_metadata(stage_dir)?;
+
+    let deliverable = metadata
+        .into_iter()
+        .filter(|batch| {
+            batch.status == CdcStageBatchStatus::Pending
+                || batch.status == CdcStageBatchStatus::Failed
+        })
+        .collect();
+
+    Ok(deliverable)
+}
+
 pub async fn execute_clickhouse_query(
     config: &ClickHouseConfig,
     query: &str,
@@ -2375,6 +2432,121 @@ mod tests {
 
         assert_eq!(batch.metadata, metadata);
         assert_eq!(batch.events, events);
+
+        std::fs::remove_dir_all(&stage_dir)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn lists_cdc_stage_batch_metadata() -> anyhow::Result<()> {
+        let stage_dir =
+            std::env::temp_dir().join("pg_snapshot_reader_list_cdc_stage_metadata_test");
+
+        if stage_dir.exists() {
+            std::fs::remove_dir_all(&stage_dir)?;
+        }
+
+        std::fs::create_dir_all(&stage_dir)?;
+
+        let events_a = vec![CdcEvent {
+            lsn: "0/100".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 1".to_string(),
+        }];
+
+        let events_b = vec![CdcEvent {
+            lsn: "0/200".to_string(),
+            xid: "2".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 2".to_string(),
+        }];
+
+        let metadata_a =
+            write_cdc_stage_batch(&stage_dir, "test_slot", &events_a)?.expect("expected metadata");
+
+        let metadata_b =
+            write_cdc_stage_batch(&stage_dir, "test_slot", &events_b)?.expect("expected metadata");
+
+        let metadata = list_cdc_stage_batch_metadata(&stage_dir)?;
+
+        assert_eq!(metadata.len(), 2);
+        assert_eq!(metadata[0], metadata_a);
+        assert_eq!(metadata[1], metadata_b);
+
+        std::fs::remove_dir_all(&stage_dir)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn lists_only_deliverable_cdc_stage_batch_metadata() -> anyhow::Result<()> {
+        let stage_dir = std::env::temp_dir()
+            .join("pg_snapshot_reader_list_deliverable_cdc_stage_metadata_test");
+
+        if stage_dir.exists() {
+            std::fs::remove_dir_all(&stage_dir)?;
+        }
+
+        std::fs::create_dir_all(&stage_dir)?;
+
+        let pending_events = vec![CdcEvent {
+            lsn: "0/100".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 1".to_string(),
+        }];
+
+        let written_events = vec![CdcEvent {
+            lsn: "0/200".to_string(),
+            xid: "2".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 2".to_string(),
+        }];
+
+        let failed_events = vec![CdcEvent {
+            lsn: "0/300".to_string(),
+            xid: "3".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 3".to_string(),
+        }];
+
+        let pending_metadata = write_cdc_stage_batch(&stage_dir, "test_slot", &pending_events)?
+            .expect("expected metadata");
+
+        let mut written_metadata = write_cdc_stage_batch(&stage_dir, "test_slot", &written_events)?
+            .expect("expected metadata");
+
+        let mut failed_metadata = write_cdc_stage_batch(&stage_dir, "test_slot", &failed_events)?
+            .expect("expected metadata");
+
+        written_metadata.status = CdcStageBatchStatus::Written;
+        failed_metadata.status = CdcStageBatchStatus::Failed;
+        failed_metadata.retry_count = 1;
+        failed_metadata.last_error = Some("target unavailable".to_string());
+
+        let written_paths = create_cdc_stage_batch_paths(&stage_dir, &written_metadata.batch_id);
+        let failed_paths = create_cdc_stage_batch_paths(&stage_dir, &failed_metadata.batch_id);
+
+        save_cdc_stage_batch_metadata(&written_paths.metadata_path, &written_metadata)?;
+        save_cdc_stage_batch_metadata(&failed_paths.metadata_path, &failed_metadata)?;
+
+        let deliverable = list_deliverable_cdc_stage_batch_metadata(&stage_dir)?;
+
+        assert_eq!(deliverable.len(), 2);
+        assert_eq!(deliverable[0], pending_metadata);
+        assert_eq!(deliverable[1], failed_metadata);
 
         std::fs::remove_dir_all(&stage_dir)?;
 
