@@ -759,6 +759,14 @@ async fn reads_decoded_wal_changes_with_test_decoding() -> anyhow::Result<()> {
             .any(|event| event.kind == CdcEventKind::Insert)
     );
 
+    let expected_table_name = format!("public.{}", table_name);
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.table_name.as_deref() == Some(expected_table_name.as_str()))
+    );
+
     let drop_slot_sql = "
         SELECT pg_drop_replication_slot(slot_name)
         FROM pg_replication_slots

@@ -120,6 +120,7 @@ pub struct CdcEvent {
     pub lsn: String,
     pub xid: String,
     pub kind: CdcEventKind,
+    pub table_name: Option<String>,
     pub raw_data: String,
 }
 
@@ -404,12 +405,26 @@ pub fn parse_decoded_wal_change(change: DecodedWalChange) -> CdcEvent {
         CdcEventKind::Other
     };
 
+    let table_name = extract_table_name_from_decoded_change(&change.data);
+
     CdcEvent {
         lsn: change.lsn,
         xid: change.xid,
         kind,
+        table_name,
         raw_data: change.data,
     }
+}
+
+pub fn extract_table_name_from_decoded_change(data: &str) -> Option<String> {
+    let rest = data.strip_prefix("table ")?;
+    let table_name = rest.split(':').next()?.trim();
+
+    if table_name.is_empty() {
+        return None;
+    }
+
+    Some(table_name.to_string())
 }
 
 pub fn parse_decoded_wal_changes(changes: Vec<DecodedWalChange>) -> Vec<CdcEvent> {
@@ -1275,5 +1290,21 @@ mod tests {
         let event = parse_decoded_wal_change(change);
 
         assert_eq!(event.kind, CdcEventKind::Delete);
+    }
+
+    #[test]
+    fn extracts_table_name_from_decoded_insert_change() {
+        let table_name = extract_table_name_from_decoded_change(
+            "table public.users: INSERT: id[integer]:1 name[text]:'Alice'",
+        );
+
+        assert_eq!(table_name, Some("public.users".to_string()));
+    }
+
+    #[test]
+    fn returns_none_for_decoded_begin_change_table_name() {
+        let table_name = extract_table_name_from_decoded_change("BEGIN 123");
+
+        assert_eq!(table_name, None);
     }
 }
