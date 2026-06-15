@@ -125,6 +125,15 @@ pub struct CdcEvent {
     pub raw_data: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CdcStageBatchMetadata {
+    pub slot_name: String,
+    pub start_lsn: String,
+    pub end_lsn: String,
+    pub event_count: usize,
+    pub events_path: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -1008,14 +1017,61 @@ pub async fn read_decoded_wal_changes_into_stage(
     client: &Client,
     slot_name: &str,
     limit: i32,
-    stage_path: &Path,
+    events_path: &Path,
+    metadata_path: &Path,
 ) -> anyhow::Result<Vec<CdcEvent>> {
     let changes = read_decoded_wal_changes(client, slot_name, limit).await?;
     let events = parse_decoded_wal_changes(changes);
 
-    write_cdc_events_jsonl(stage_path, &events)?;
+    write_cdc_events_jsonl(events_path, &events)?;
+
+    if let Some(metadata) = create_cdc_stage_batch_metadata(slot_name, events_path, &events) {
+        save_cdc_stage_batch_metadata(metadata_path, &metadata)?;
+    }
 
     Ok(events)
+}
+
+pub fn save_cdc_stage_batch_metadata(
+    path: &Path,
+    metadata: &CdcStageBatchMetadata,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let json = serde_json::to_string_pretty(metadata)?;
+    fs::write(path, json)?;
+
+    Ok(())
+}
+
+pub fn load_cdc_stage_batch_metadata(path: &Path) -> anyhow::Result<Option<CdcStageBatchMetadata>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(path)?;
+    let metadata = serde_json::from_str(&contents)?;
+
+    Ok(Some(metadata))
+}
+
+pub fn create_cdc_stage_batch_metadata(
+    slot_name: &str,
+    events_path: &Path,
+    events: &[CdcEvent],
+) -> Option<CdcStageBatchMetadata> {
+    let first_event = events.first()?;
+    let last_event = events.last()?;
+
+    Some(CdcStageBatchMetadata {
+        slot_name: slot_name.to_string(),
+        start_lsn: first_event.lsn.clone(),
+        end_lsn: last_event.lsn.clone(),
+        event_count: events.len(),
+        events_path: events_path.to_string_lossy().to_string(),
+    })
 }
 
 pub async fn execute_clickhouse_query(
@@ -1445,6 +1501,84 @@ mod tests {
         let events = read_cdc_events_jsonl(&path)?;
 
         assert_eq!(events, vec![event]);
+
+        std::fs::remove_file(&path)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn creates_cdc_stage_batch_metadata_from_events() {
+        let events_path = Path::new("cdc_events.jsonl");
+
+        let events = vec![
+            CdcEvent {
+                lsn: "0/100".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Begin,
+                table_name: None,
+                column_values: HashMap::new(),
+                raw_data: "BEGIN 1".to_string(),
+            },
+            CdcEvent {
+                lsn: "0/120".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Insert,
+                table_name: Some("public.users".to_string()),
+                column_values: HashMap::new(),
+                raw_data: "table public.users: INSERT: id[integer]:1".to_string(),
+            },
+            CdcEvent {
+                lsn: "0/150".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Commit,
+                table_name: None,
+                column_values: HashMap::new(),
+                raw_data: "COMMIT 1".to_string(),
+            },
+        ];
+
+        let metadata = create_cdc_stage_batch_metadata("test_slot", events_path, &events)
+            .expect("expected metadata");
+
+        assert_eq!(metadata.slot_name, "test_slot");
+        assert_eq!(metadata.start_lsn, "0/100");
+        assert_eq!(metadata.end_lsn, "0/150");
+        assert_eq!(metadata.event_count, 3);
+        assert_eq!(metadata.events_path, "cdc_events.jsonl");
+    }
+
+    #[test]
+    fn does_not_create_cdc_stage_batch_metadata_for_empty_events() {
+        let events_path = Path::new("cdc_events.jsonl");
+
+        let metadata = create_cdc_stage_batch_metadata("test_slot", events_path, &[]);
+
+        assert_eq!(metadata, None);
+    }
+
+    #[test]
+    fn saves_and_loads_cdc_stage_batch_metadata() -> anyhow::Result<()> {
+        let path =
+            std::env::temp_dir().join("pg_snapshot_reader_cdc_stage_batch_metadata_test.json");
+
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+
+        let metadata = CdcStageBatchMetadata {
+            slot_name: "test_slot".to_string(),
+            start_lsn: "0/100".to_string(),
+            end_lsn: "0/150".to_string(),
+            event_count: 3,
+            events_path: "cdc_events.jsonl".to_string(),
+        };
+
+        save_cdc_stage_batch_metadata(&path, &metadata)?;
+
+        let loaded = load_cdc_stage_batch_metadata(&path)?;
+
+        assert_eq!(loaded, Some(metadata));
 
         std::fs::remove_file(&path)?;
 

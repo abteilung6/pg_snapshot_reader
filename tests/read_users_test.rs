@@ -6,10 +6,10 @@ use pg_snapshot_reader::{
     check_postgres_cdc_prerequisites, count_clickhouse_rows, create_clickhouse_snapshot_table,
     create_logical_replication_slot, create_logical_replication_slot_with_plugin,
     create_publication_for_table, discover_table_schema, execute_clickhouse_query,
-    parse_decoded_wal_changes, read_cdc_events_jsonl, read_decoded_wal_changes,
-    read_decoded_wal_changes_into_stage, read_snapshot_rows_batch, read_snapshot_rows_full,
-    read_snapshot_rows_full_with_checkpoint, read_snapshot_rows_full_with_stage_and_checkpoint,
-    write_staged_snapshot_rows,
+    load_cdc_stage_batch_metadata, parse_decoded_wal_changes, read_cdc_events_jsonl,
+    read_decoded_wal_changes, read_decoded_wal_changes_into_stage, read_snapshot_rows_batch,
+    read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
+    read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
 };
 use tokio_postgres::{Client, Error, NoTls};
 
@@ -746,27 +746,16 @@ async fn reads_decoded_wal_changes_with_test_decoding() -> anyhow::Result<()> {
 
     client.execute(&insert_sql, &[]).await?;
 
-    let changes = read_decoded_wal_changes(&client, &slot_name, 10).await?;
-
-    assert!(changes.iter().any(|change| change.data.contains("INSERT")));
-
-    assert!(changes.iter().any(|change| change.data.contains("Alice")));
-
-    let events = parse_decoded_wal_changes(changes);
-
-    assert!(
-        events
-            .iter()
-            .any(|event| event.kind == CdcEventKind::Insert)
-    );
+    let changes = read_decoded_wal_changes(&client, &slot_name, 1000).await?;
 
     let expected_table_name = format!("public.{}", table_name);
+    let events = parse_decoded_wal_changes(changes);
 
-    assert!(
-        events
-            .iter()
-            .any(|event| event.table_name.as_deref() == Some(expected_table_name.as_str()))
-    );
+    assert!(events.iter().any(|event| {
+        event.kind == CdcEventKind::Insert
+            && event.table_name.as_deref() == Some(expected_table_name.as_str())
+            && event.column_values.get("name") == Some(&SnapshotValue::String("Alice".to_string()))
+    }));
 
     let drop_slot_sql = "
         SELECT pg_drop_replication_slot(slot_name)
@@ -815,7 +804,15 @@ async fn reads_decoded_wal_changes_into_cdc_stage() -> anyhow::Result<()> {
     );
     client.execute(&insert_sql, &[]).await?;
 
-    let events = read_decoded_wal_changes_into_stage(&client, &slot_name, 10, &stage_path).await?;
+    let metadata_path = std::env::temp_dir().join(format!("{}_cdc_events.meta.json", table_name));
+
+    if metadata_path.exists() {
+        std::fs::remove_file(&metadata_path)?;
+    }
+
+    let events =
+        read_decoded_wal_changes_into_stage(&client, &slot_name, 10, &stage_path, &metadata_path)
+            .await?;
 
     assert!(
         events
@@ -835,6 +832,26 @@ async fn reads_decoded_wal_changes_into_cdc_stage() -> anyhow::Result<()> {
             .any(|event| event.table_name.as_deref() == Some(expected_table_name.as_str()))
     );
 
+    let metadata =
+        load_cdc_stage_batch_metadata(&metadata_path)?.expect("expected CDC stage metadata");
+
+    assert_eq!(metadata.slot_name, slot_name);
+    assert_eq!(metadata.event_count, events.len());
+    assert_eq!(
+        metadata.events_path,
+        stage_path.to_string_lossy().to_string()
+    );
+
+    assert_eq!(
+        metadata.start_lsn,
+        events.first().expect("expected first event").lsn
+    );
+
+    assert_eq!(
+        metadata.end_lsn,
+        events.last().expect("expected last event").lsn
+    );
+
     let drop_slot_sql = "
         SELECT pg_drop_replication_slot(slot_name)
         FROM pg_replication_slots
@@ -847,6 +864,10 @@ async fn reads_decoded_wal_changes_into_cdc_stage() -> anyhow::Result<()> {
 
     if stage_path.exists() {
         std::fs::remove_file(&stage_path)?;
+    }
+
+    if metadata_path.exists() {
+        std::fs::remove_file(&metadata_path)?;
     }
 
     Ok(())
