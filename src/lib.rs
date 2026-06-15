@@ -126,12 +126,23 @@ pub struct CdcEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum CdcStageBatchStatus {
+    Pending,
+    Writing,
+    Written,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CdcStageBatchMetadata {
     pub slot_name: String,
     pub start_lsn: String,
     pub end_lsn: String,
     pub event_count: usize,
     pub events_path: String,
+    pub status: CdcStageBatchStatus,
+    pub retry_count: u32,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1071,7 +1082,31 @@ pub fn create_cdc_stage_batch_metadata(
         end_lsn: last_event.lsn.clone(),
         event_count: events.len(),
         events_path: events_path.to_string_lossy().to_string(),
+        status: CdcStageBatchStatus::Pending,
+        retry_count: 0,
+        last_error: None,
     })
+}
+
+pub fn update_cdc_stage_batch_status(
+    path: &Path,
+    status: CdcStageBatchStatus,
+    last_error: Option<String>,
+) -> anyhow::Result<()> {
+    let mut metadata =
+        load_cdc_stage_batch_metadata(path)?.expect("expected CDC stage batch metadata");
+
+    metadata.status = status;
+
+    if last_error.is_some() {
+        metadata.retry_count += 1;
+    }
+
+    metadata.last_error = last_error;
+
+    save_cdc_stage_batch_metadata(path, &metadata)?;
+
+    Ok(())
 }
 
 pub fn write_cdc_events_jsonl_atomic(path: &Path, events: &[CdcEvent]) -> anyhow::Result<()> {
@@ -1564,6 +1599,9 @@ mod tests {
         assert_eq!(metadata.end_lsn, "0/150");
         assert_eq!(metadata.event_count, 3);
         assert_eq!(metadata.events_path, "cdc_events.jsonl");
+        assert_eq!(metadata.status, CdcStageBatchStatus::Pending);
+        assert_eq!(metadata.retry_count, 0);
+        assert_eq!(metadata.last_error, None);
     }
 
     #[test]
@@ -1590,6 +1628,9 @@ mod tests {
             end_lsn: "0/150".to_string(),
             event_count: 3,
             events_path: "cdc_events.jsonl".to_string(),
+            status: CdcStageBatchStatus::Pending,
+            retry_count: 0,
+            last_error: None,
         };
 
         save_cdc_stage_batch_metadata(&path, &metadata)?;
@@ -1637,6 +1678,47 @@ mod tests {
         let events = read_cdc_events_jsonl(&path)?;
 
         assert_eq!(events, vec![event]);
+
+        std::fs::remove_file(&path)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn updates_cdc_stage_batch_status() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join("pg_snapshot_reader_cdc_stage_batch_status_test.json");
+
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+
+        let metadata = CdcStageBatchMetadata {
+            slot_name: "test_slot".to_string(),
+            start_lsn: "0/100".to_string(),
+            end_lsn: "0/150".to_string(),
+            event_count: 3,
+            events_path: "cdc_events.jsonl".to_string(),
+            status: CdcStageBatchStatus::Pending,
+            retry_count: 0,
+            last_error: None,
+        };
+
+        save_cdc_stage_batch_metadata(&path, &metadata)?;
+
+        update_cdc_stage_batch_status(
+            &path,
+            CdcStageBatchStatus::Failed,
+            Some("ClickHouse unavailable".to_string()),
+        )?;
+
+        let loaded = load_cdc_stage_batch_metadata(&path)?.expect("expected metadata");
+
+        assert_eq!(loaded.status, CdcStageBatchStatus::Failed);
+        assert_eq!(loaded.retry_count, 1);
+        assert_eq!(
+            loaded.last_error,
+            Some("ClickHouse unavailable".to_string())
+        );
 
         std::fs::remove_file(&path)?;
 
