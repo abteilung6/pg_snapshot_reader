@@ -170,6 +170,12 @@ pub struct CdcStageBatchPaths {
     pub metadata_path: std::path::PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CdcStageBatch {
+    pub metadata: CdcStageBatchMetadata,
+    pub events: Vec<CdcEvent>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -1202,14 +1208,13 @@ pub async fn deliver_cdc_stage_batch<W>(metadata_path: &Path, writer: &W) -> any
 where
     W: CdcEventWriter + Sync,
 {
-    let metadata =
-        load_cdc_stage_batch_metadata(metadata_path)?.expect("expected CDC stage batch metadata");
+    let batch = read_cdc_stage_batch(metadata_path)?;
 
-    if metadata.status == CdcStageBatchStatus::Written {
+    if batch.metadata.status == CdcStageBatchStatus::Written {
         return Ok(());
     }
 
-    let events = validate_cdc_stage_batch(&metadata)?;
+    let events = batch.events;
 
     update_cdc_stage_batch_status(metadata_path, CdcStageBatchStatus::Writing, None)?;
 
@@ -1265,6 +1270,15 @@ pub fn write_cdc_stage_batch(
     save_cdc_stage_batch_metadata(&paths.metadata_path, &metadata)?;
 
     Ok(Some(metadata))
+}
+
+pub fn read_cdc_stage_batch(metadata_path: &Path) -> anyhow::Result<CdcStageBatch> {
+    let metadata =
+        load_cdc_stage_batch_metadata(metadata_path)?.expect("expected CDC stage batch metadata");
+
+    let events = validate_cdc_stage_batch(&metadata)?;
+
+    Ok(CdcStageBatch { metadata, events })
 }
 
 pub async fn execute_clickhouse_query(
@@ -2314,6 +2328,53 @@ mod tests {
         assert_eq!(metadata, None);
 
         assert_eq!(std::fs::read_dir(&stage_dir)?.count(), 0);
+
+        std::fs::remove_dir_all(&stage_dir)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn reads_cdc_stage_batch_from_metadata() -> anyhow::Result<()> {
+        let stage_dir = std::env::temp_dir().join("pg_snapshot_reader_read_cdc_stage_batch_test");
+
+        if stage_dir.exists() {
+            std::fs::remove_dir_all(&stage_dir)?;
+        }
+
+        std::fs::create_dir_all(&stage_dir)?;
+
+        let events = vec![
+            CdcEvent {
+                lsn: "0/100".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Begin,
+                table_name: None,
+                column_values: HashMap::new(),
+                raw_data: "BEGIN 1".to_string(),
+            },
+            CdcEvent {
+                lsn: "0/120".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Insert,
+                table_name: Some("public.users".to_string()),
+                column_values: HashMap::from([(
+                    "id".to_string(),
+                    SnapshotValue::String("1".to_string()),
+                )]),
+                raw_data: "table public.users: INSERT: id[integer]:1".to_string(),
+            },
+        ];
+
+        let metadata =
+            write_cdc_stage_batch(&stage_dir, "test_slot", &events)?.expect("expected metadata");
+
+        let paths = create_cdc_stage_batch_paths(&stage_dir, &metadata.batch_id);
+
+        let batch = read_cdc_stage_batch(&paths.metadata_path)?;
+
+        assert_eq!(batch.metadata, metadata);
+        assert_eq!(batch.events, events);
 
         std::fs::remove_dir_all(&stage_dir)?;
 
