@@ -153,6 +153,7 @@ pub enum CdcStageBatchStatus {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CdcStageBatchMetadata {
+    pub batch_id: String,
     pub slot_name: String,
     pub start_lsn: String,
     pub end_lsn: String,
@@ -1094,10 +1095,16 @@ pub fn create_cdc_stage_batch_metadata(
     let first_event = events.first()?;
     let last_event = events.last()?;
 
+    let start_lsn = first_event.lsn.clone();
+    let end_lsn = last_event.lsn.clone();
+
+    let batch_id = create_cdc_stage_batch_id(slot_name, &start_lsn, &end_lsn);
+
     Some(CdcStageBatchMetadata {
+        batch_id,
         slot_name: slot_name.to_string(),
-        start_lsn: first_event.lsn.clone(),
-        end_lsn: last_event.lsn.clone(),
+        start_lsn,
+        end_lsn,
         event_count: events.len(),
         events_path: events_path.to_string_lossy().to_string(),
         status: CdcStageBatchStatus::Pending,
@@ -1125,6 +1132,13 @@ pub fn update_cdc_stage_batch_status(
     save_cdc_stage_batch_metadata(path, &metadata)?;
 
     Ok(())
+}
+
+pub fn create_cdc_stage_batch_id(slot_name: &str, start_lsn: &str, end_lsn: &str) -> String {
+    let safe_start_lsn = start_lsn.replace('/', "_");
+    let safe_end_lsn = end_lsn.replace('/', "_");
+
+    format!("{}_{}_{}", slot_name, safe_start_lsn, safe_end_lsn)
 }
 
 pub fn write_cdc_events_jsonl_atomic(path: &Path, events: &[CdcEvent]) -> anyhow::Result<()> {
@@ -1716,6 +1730,7 @@ mod tests {
         }
 
         let metadata = CdcStageBatchMetadata {
+            batch_id: "test_slot_0_100_0_100".to_string(),
             slot_name: "test_slot".to_string(),
             start_lsn: "0/100".to_string(),
             end_lsn: "0/150".to_string(),
@@ -1786,6 +1801,7 @@ mod tests {
         }
 
         let metadata = CdcStageBatchMetadata {
+            batch_id: "test_slot_0_100_0_100".to_string(),
             slot_name: "test_slot".to_string(),
             start_lsn: "0/100".to_string(),
             end_lsn: "0/150".to_string(),
@@ -1857,6 +1873,7 @@ mod tests {
         write_cdc_events_jsonl_atomic(&events_path, &events)?;
 
         let metadata = CdcStageBatchMetadata {
+            batch_id: "test_slot_0_100_0_100".to_string(),
             slot_name: "test_slot".to_string(),
             start_lsn: "0/100".to_string(),
             end_lsn: "0/150".to_string(),
@@ -1897,6 +1914,7 @@ mod tests {
         write_cdc_events_jsonl_atomic(&events_path, &events)?;
 
         let metadata = CdcStageBatchMetadata {
+            batch_id: "test_slot_0_100_0_100".to_string(),
             slot_name: "test_slot".to_string(),
             start_lsn: "0/100".to_string(),
             end_lsn: "0/100".to_string(),
@@ -1937,6 +1955,7 @@ mod tests {
         write_cdc_events_jsonl_atomic(&events_path, &events)?;
 
         let metadata = CdcStageBatchMetadata {
+            batch_id: "test_slot_0_100_0_100".to_string(),
             slot_name: "test_slot".to_string(),
             start_lsn: "0/999".to_string(),
             end_lsn: "0/100".to_string(),
@@ -2151,5 +2170,12 @@ mod tests {
         std::fs::remove_file(&metadata_path)?;
 
         Ok(())
+    }
+
+    #[test]
+    fn creates_cdc_stage_batch_id_from_slot_and_lsn_bounds() {
+        let batch_id = create_cdc_stage_batch_id("test_slot", "0/100", "0/150");
+
+        assert_eq!(batch_id, "test_slot_0_100_0_150");
     }
 }
