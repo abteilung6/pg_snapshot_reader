@@ -1127,6 +1127,46 @@ pub fn write_cdc_events_jsonl_atomic(path: &Path, events: &[CdcEvent]) -> anyhow
     Ok(())
 }
 
+pub fn validate_cdc_stage_batch(metadata: &CdcStageBatchMetadata) -> anyhow::Result<Vec<CdcEvent>> {
+    let events_path = Path::new(&metadata.events_path);
+
+    let events = read_cdc_events_jsonl(events_path)?;
+
+    if events.len() != metadata.event_count {
+        anyhow::bail!(
+            "CDC stage batch event count mismatch: metadata says {}, file contains {}",
+            metadata.event_count,
+            events.len()
+        );
+    }
+
+    let first_event = events
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("CDC stage batch contains no events"))?;
+
+    let last_event = events
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("CDC stage batch contains no events"))?;
+
+    if first_event.lsn != metadata.start_lsn {
+        anyhow::bail!(
+            "CDC stage batch start_lsn mismatch: metadata says {}, first event has {}",
+            metadata.start_lsn,
+            first_event.lsn
+        );
+    }
+
+    if last_event.lsn != metadata.end_lsn {
+        anyhow::bail!(
+            "CDC stage batch end_lsn mismatch: metadata says {}, last event has {}",
+            metadata.end_lsn,
+            last_event.lsn
+        );
+    }
+
+    Ok(events)
+}
+
 pub async fn execute_clickhouse_query(
     config: &ClickHouseConfig,
     query: &str,
@@ -1721,6 +1761,144 @@ mod tests {
         );
 
         std::fs::remove_file(&path)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn validates_cdc_stage_batch() -> anyhow::Result<()> {
+        let events_path =
+            std::env::temp_dir().join("pg_snapshot_reader_valid_cdc_stage_batch.jsonl");
+
+        if events_path.exists() {
+            std::fs::remove_file(&events_path)?;
+        }
+
+        let events = vec![
+            CdcEvent {
+                lsn: "0/100".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Begin,
+                table_name: None,
+                column_values: HashMap::new(),
+                raw_data: "BEGIN 1".to_string(),
+            },
+            CdcEvent {
+                lsn: "0/120".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Insert,
+                table_name: Some("public.users".to_string()),
+                column_values: HashMap::new(),
+                raw_data: "table public.users: INSERT: id[integer]:1".to_string(),
+            },
+            CdcEvent {
+                lsn: "0/150".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Commit,
+                table_name: None,
+                column_values: HashMap::new(),
+                raw_data: "COMMIT 1".to_string(),
+            },
+        ];
+
+        write_cdc_events_jsonl_atomic(&events_path, &events)?;
+
+        let metadata = CdcStageBatchMetadata {
+            slot_name: "test_slot".to_string(),
+            start_lsn: "0/100".to_string(),
+            end_lsn: "0/150".to_string(),
+            event_count: 3,
+            events_path: events_path.to_string_lossy().to_string(),
+            status: CdcStageBatchStatus::Pending,
+            retry_count: 0,
+            last_error: None,
+        };
+
+        let validated_events = validate_cdc_stage_batch(&metadata)?;
+
+        assert_eq!(validated_events, events);
+
+        std::fs::remove_file(&events_path)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_cdc_stage_batch_with_wrong_event_count() -> anyhow::Result<()> {
+        let events_path =
+            std::env::temp_dir().join("pg_snapshot_reader_invalid_cdc_stage_batch_count.jsonl");
+
+        if events_path.exists() {
+            std::fs::remove_file(&events_path)?;
+        }
+
+        let events = vec![CdcEvent {
+            lsn: "0/100".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 1".to_string(),
+        }];
+
+        write_cdc_events_jsonl_atomic(&events_path, &events)?;
+
+        let metadata = CdcStageBatchMetadata {
+            slot_name: "test_slot".to_string(),
+            start_lsn: "0/100".to_string(),
+            end_lsn: "0/100".to_string(),
+            event_count: 2,
+            events_path: events_path.to_string_lossy().to_string(),
+            status: CdcStageBatchStatus::Pending,
+            retry_count: 0,
+            last_error: None,
+        };
+
+        let result = validate_cdc_stage_batch(&metadata);
+
+        assert!(result.is_err());
+
+        std::fs::remove_file(&events_path)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_cdc_stage_batch_with_wrong_lsn_bounds() -> anyhow::Result<()> {
+        let events_path =
+            std::env::temp_dir().join("pg_snapshot_reader_invalid_cdc_stage_batch_lsn.jsonl");
+
+        if events_path.exists() {
+            std::fs::remove_file(&events_path)?;
+        }
+
+        let events = vec![CdcEvent {
+            lsn: "0/100".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 1".to_string(),
+        }];
+
+        write_cdc_events_jsonl_atomic(&events_path, &events)?;
+
+        let metadata = CdcStageBatchMetadata {
+            slot_name: "test_slot".to_string(),
+            start_lsn: "0/999".to_string(),
+            end_lsn: "0/100".to_string(),
+            event_count: 1,
+            events_path: events_path.to_string_lossy().to_string(),
+            status: CdcStageBatchStatus::Pending,
+            retry_count: 0,
+            last_error: None,
+        };
+
+        let result = validate_cdc_stage_batch(&metadata);
+
+        assert!(result.is_err());
+
+        std::fs::remove_file(&events_path)?;
 
         Ok(())
     }
