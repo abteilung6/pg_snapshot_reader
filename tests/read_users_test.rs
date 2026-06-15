@@ -6,9 +6,10 @@ use pg_snapshot_reader::{
     check_postgres_cdc_prerequisites, count_clickhouse_rows, create_clickhouse_snapshot_table,
     create_logical_replication_slot, create_logical_replication_slot_with_plugin,
     create_publication_for_table, discover_table_schema, execute_clickhouse_query,
-    parse_decoded_wal_changes, read_decoded_wal_changes, read_snapshot_rows_batch,
-    read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
-    read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
+    parse_decoded_wal_changes, read_cdc_events_jsonl, read_decoded_wal_changes,
+    read_decoded_wal_changes_into_stage, read_snapshot_rows_batch, read_snapshot_rows_full,
+    read_snapshot_rows_full_with_checkpoint, read_snapshot_rows_full_with_stage_and_checkpoint,
+    write_staged_snapshot_rows,
 };
 use tokio_postgres::{Client, Error, NoTls};
 
@@ -777,6 +778,76 @@ async fn reads_decoded_wal_changes_with_test_decoding() -> anyhow::Result<()> {
 
     let drop_table_sql = format!("DROP TABLE {}", table_name);
     client.execute(&drop_table_sql, &[]).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn reads_decoded_wal_changes_into_cdc_stage() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+    let table_name = unique_table_name();
+    let slot_name = format!("{}_slot", table_name);
+    let stage_path = std::env::temp_dir().join(format!("{}_cdc_events.jsonl", table_name));
+
+    if stage_path.exists() {
+        std::fs::remove_file(&stage_path)?;
+    }
+
+    create_logical_replication_slot_with_plugin(&client, &slot_name, "test_decoding").await?;
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+    client.execute(&create_table_sql, &[]).await?;
+
+    let insert_sql = format!(
+        "
+        INSERT INTO {} (name)
+        VALUES ('Alice')
+        ",
+        table_name
+    );
+    client.execute(&insert_sql, &[]).await?;
+
+    let events = read_decoded_wal_changes_into_stage(&client, &slot_name, 10, &stage_path).await?;
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == CdcEventKind::Insert)
+    );
+
+    let staged_events = read_cdc_events_jsonl(&stage_path)?;
+
+    assert_eq!(staged_events, events);
+
+    let expected_table_name = format!("public.{}", table_name);
+
+    assert!(
+        staged_events
+            .iter()
+            .any(|event| event.table_name.as_deref() == Some(expected_table_name.as_str()))
+    );
+
+    let drop_slot_sql = "
+        SELECT pg_drop_replication_slot(slot_name)
+        FROM pg_replication_slots
+        WHERE slot_name = $1
+    ";
+    client.execute(drop_slot_sql, &[&slot_name]).await?;
+
+    let drop_table_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_table_sql, &[]).await?;
+
+    if stage_path.exists() {
+        std::fs::remove_file(&stage_path)?;
+    }
 
     Ok(())
 }

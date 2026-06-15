@@ -1004,6 +1004,20 @@ where
     Ok(())
 }
 
+pub async fn read_decoded_wal_changes_into_stage(
+    client: &Client,
+    slot_name: &str,
+    limit: i32,
+    stage_path: &Path,
+) -> anyhow::Result<Vec<CdcEvent>> {
+    let changes = read_decoded_wal_changes(client, slot_name, limit).await?;
+    let events = parse_decoded_wal_changes(changes);
+
+    write_cdc_events_jsonl(stage_path, &events)?;
+
+    Ok(events)
+}
+
 pub async fn execute_clickhouse_query(
     config: &ClickHouseConfig,
     query: &str,
