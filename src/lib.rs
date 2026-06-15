@@ -105,7 +105,7 @@ pub struct DecodedWalChange {
     pub data: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CdcEventKind {
     Begin,
     Commit,
@@ -115,7 +115,7 @@ pub enum CdcEventKind {
     Other,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CdcEvent {
     pub lsn: String,
     pub xid: String,
@@ -963,6 +963,37 @@ fn reads_snapshot_rows_from_jsonl() {
     std::fs::remove_file(path).unwrap();
 }
 
+pub fn write_cdc_events_jsonl(path: &Path, events: &[CdcEvent]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+
+    for event in events {
+        let json = serde_json::to_string(event)?;
+        writeln!(file, "{}", json)?;
+    }
+
+    Ok(())
+}
+
+pub fn read_cdc_events_jsonl(path: &Path) -> anyhow::Result<Vec<CdcEvent>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let contents = fs::read_to_string(path)?;
+    let mut events = Vec::new();
+
+    for line in contents.lines() {
+        let event = serde_json::from_str(line)?;
+        events.push(event);
+    }
+
+    Ok(events)
+}
+
 pub async fn write_staged_snapshot_rows<W>(stage_path: &Path, writer: &W) -> anyhow::Result<()>
 where
     W: SnapshotRowWriter + Sync,
@@ -1370,5 +1401,39 @@ mod tests {
             values.get("name"),
             Some(&SnapshotValue::String("Alice".to_string()))
         );
+    }
+
+    #[test]
+    fn writes_and_reads_cdc_events_jsonl() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join("pg_snapshot_reader_cdc_events_test.jsonl");
+
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+
+        let event = CdcEvent {
+            lsn: "0/16B6C60".to_string(),
+            xid: "123".to_string(),
+            kind: CdcEventKind::Insert,
+            table_name: Some("public.users".to_string()),
+            column_values: HashMap::from([
+                ("id".to_string(), SnapshotValue::String("1".to_string())),
+                (
+                    "name".to_string(),
+                    SnapshotValue::String("Alice".to_string()),
+                ),
+            ]),
+            raw_data: "table public.users: INSERT: id[integer]:1 name[text]:'Alice'".to_string(),
+        };
+
+        write_cdc_events_jsonl(&path, &[event.clone()])?;
+
+        let events = read_cdc_events_jsonl(&path)?;
+
+        assert_eq!(events, vec![event]);
+
+        std::fs::remove_file(&path)?;
+
+        Ok(())
     }
 }
