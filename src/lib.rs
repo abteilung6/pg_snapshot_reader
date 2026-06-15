@@ -105,6 +105,24 @@ pub struct DecodedWalChange {
     pub data: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum CdcEventKind {
+    Begin,
+    Commit,
+    Insert,
+    Update,
+    Delete,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CdcEvent {
+    pub lsn: String,
+    pub xid: String,
+    pub kind: CdcEventKind,
+    pub raw_data: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -369,6 +387,33 @@ pub async fn check_postgres_cdc_prerequisites(
 
 fn quote_postgres_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+pub fn parse_decoded_wal_change(change: DecodedWalChange) -> CdcEvent {
+    let kind = if change.data.starts_with("BEGIN") {
+        CdcEventKind::Begin
+    } else if change.data.starts_with("COMMIT") {
+        CdcEventKind::Commit
+    } else if change.data.contains(": INSERT:") {
+        CdcEventKind::Insert
+    } else if change.data.contains(": UPDATE:") {
+        CdcEventKind::Update
+    } else if change.data.contains(": DELETE:") {
+        CdcEventKind::Delete
+    } else {
+        CdcEventKind::Other
+    };
+
+    CdcEvent {
+        lsn: change.lsn,
+        xid: change.xid,
+        kind,
+        raw_data: change.data,
+    }
+}
+
+pub fn parse_decoded_wal_changes(changes: Vec<DecodedWalChange>) -> Vec<CdcEvent> {
+    changes.into_iter().map(parse_decoded_wal_change).collect()
 }
 
 pub async fn read_snapshot_rows_batch(
@@ -1164,5 +1209,71 @@ mod tests {
             quote_postgres_identifier("weird\"name"),
             "\"weird\"\"name\""
         );
+    }
+
+    #[test]
+    fn parses_begin_decoded_wal_change() {
+        let change = DecodedWalChange {
+            lsn: "0/16B6C50".to_string(),
+            xid: "123".to_string(),
+            data: "BEGIN 123".to_string(),
+        };
+
+        let event = parse_decoded_wal_change(change);
+
+        assert_eq!(event.kind, CdcEventKind::Begin);
+    }
+
+    #[test]
+    fn parses_commit_decoded_wal_change() {
+        let change = DecodedWalChange {
+            lsn: "0/16B6C80".to_string(),
+            xid: "123".to_string(),
+            data: "COMMIT 123".to_string(),
+        };
+
+        let event = parse_decoded_wal_change(change);
+
+        assert_eq!(event.kind, CdcEventKind::Commit);
+    }
+
+    #[test]
+    fn parses_insert_decoded_wal_change() {
+        let change = DecodedWalChange {
+            lsn: "0/16B6C60".to_string(),
+            xid: "123".to_string(),
+            data: "table public.users: INSERT: id[integer]:1 name[text]:'Alice'".to_string(),
+        };
+
+        let event = parse_decoded_wal_change(change);
+
+        assert_eq!(event.kind, CdcEventKind::Insert);
+    }
+
+    #[test]
+    fn parses_update_decoded_wal_change() {
+        let change = DecodedWalChange {
+            lsn: "0/16B6C70".to_string(),
+            xid: "123".to_string(),
+            data: "table public.users: UPDATE: id[integer]:1 name[text]:'Alice Updated'"
+                .to_string(),
+        };
+
+        let event = parse_decoded_wal_change(change);
+
+        assert_eq!(event.kind, CdcEventKind::Update);
+    }
+
+    #[test]
+    fn parses_delete_decoded_wal_change() {
+        let change = DecodedWalChange {
+            lsn: "0/16B6C75".to_string(),
+            xid: "123".to_string(),
+            data: "table public.users: DELETE: id[integer]:1".to_string(),
+        };
+
+        let event = parse_decoded_wal_change(change);
+
+        assert_eq!(event.kind, CdcEventKind::Delete);
     }
 }

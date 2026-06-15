@@ -2,13 +2,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pg_snapshot_reader::{
-    ClickHouseConfig, ClickHouseSnapshotRowWriter, SnapshotCheckpoint, SnapshotValue,
+    CdcEventKind, ClickHouseConfig, ClickHouseSnapshotRowWriter, SnapshotCheckpoint, SnapshotValue,
     check_postgres_cdc_prerequisites, count_clickhouse_rows, create_clickhouse_snapshot_table,
     create_logical_replication_slot, create_logical_replication_slot_with_plugin,
     create_publication_for_table, discover_table_schema, execute_clickhouse_query,
-    read_decoded_wal_changes, read_snapshot_rows_batch, read_snapshot_rows_full,
-    read_snapshot_rows_full_with_checkpoint, read_snapshot_rows_full_with_stage_and_checkpoint,
-    write_staged_snapshot_rows,
+    parse_decoded_wal_changes, read_decoded_wal_changes, read_snapshot_rows_batch,
+    read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
+    read_snapshot_rows_full_with_stage_and_checkpoint, write_staged_snapshot_rows,
 };
 use tokio_postgres::{Client, Error, NoTls};
 
@@ -750,6 +750,14 @@ async fn reads_decoded_wal_changes_with_test_decoding() -> anyhow::Result<()> {
     assert!(changes.iter().any(|change| change.data.contains("INSERT")));
 
     assert!(changes.iter().any(|change| change.data.contains("Alice")));
+
+    let events = parse_decoded_wal_changes(changes);
+
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == CdcEventKind::Insert)
+    );
 
     let drop_slot_sql = "
         SELECT pg_drop_replication_slot(slot_name)
