@@ -164,6 +164,12 @@ pub struct CdcStageBatchMetadata {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CdcStageBatchPaths {
+    pub events_path: std::path::PathBuf,
+    pub metadata_path: std::path::PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -1234,6 +1240,13 @@ where
     }
 }
 
+pub fn create_cdc_stage_batch_paths(stage_dir: &Path, batch_id: &str) -> CdcStageBatchPaths {
+    CdcStageBatchPaths {
+        events_path: stage_dir.join(format!("{}.jsonl", batch_id)),
+        metadata_path: stage_dir.join(format!("{}.meta.json", batch_id)),
+    }
+}
+
 pub async fn execute_clickhouse_query(
     config: &ClickHouseConfig,
     query: &str,
@@ -2177,5 +2190,23 @@ mod tests {
         let batch_id = create_cdc_stage_batch_id("test_slot", "0/100", "0/150");
 
         assert_eq!(batch_id, "test_slot_0_100_0_150");
+    }
+
+    #[test]
+    fn creates_cdc_stage_batch_paths_from_stage_dir_and_batch_id() {
+        let stage_dir = Path::new("cdc_stage");
+        let batch_id = "test_slot_0_100_0_150";
+
+        let paths = create_cdc_stage_batch_paths(stage_dir, batch_id);
+
+        assert_eq!(
+            paths.events_path,
+            Path::new("cdc_stage").join("test_slot_0_100_0_150.jsonl")
+        );
+
+        assert_eq!(
+            paths.metadata_path,
+            Path::new("cdc_stage").join("test_slot_0_100_0_150.meta.json")
+        );
     }
 }
