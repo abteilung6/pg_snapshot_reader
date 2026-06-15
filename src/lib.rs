@@ -1192,6 +1192,10 @@ where
     let metadata =
         load_cdc_stage_batch_metadata(metadata_path)?.expect("expected CDC stage batch metadata");
 
+    if metadata.status == CdcStageBatchStatus::Written {
+        return Ok(());
+    }
+
     let events = validate_cdc_stage_batch(&metadata)?;
 
     update_cdc_stage_batch_status(metadata_path, CdcStageBatchStatus::Writing, None)?;
@@ -2083,6 +2087,65 @@ mod tests {
         assert_eq!(loaded.status, CdcStageBatchStatus::Failed);
         assert_eq!(loaded.retry_count, 1);
         assert_eq!(loaded.last_error, Some("target unavailable".to_string()));
+
+        std::fs::remove_file(&events_path)?;
+        std::fs::remove_file(&metadata_path)?;
+
+        Ok(())
+    }
+
+    struct PanicCdcEventWriter;
+
+    #[async_trait]
+    impl CdcEventWriter for PanicCdcEventWriter {
+        async fn write_events(&self, _events: &[CdcEvent]) -> anyhow::Result<()> {
+            panic!("writer should not be called for already written batches");
+        }
+    }
+
+    #[tokio::test]
+    async fn skips_already_written_cdc_stage_batch() -> anyhow::Result<()> {
+        let events_path =
+            std::env::temp_dir().join("pg_snapshot_reader_skip_written_cdc_events.jsonl");
+
+        let metadata_path =
+            std::env::temp_dir().join("pg_snapshot_reader_skip_written_cdc_events.meta.json");
+
+        if events_path.exists() {
+            std::fs::remove_file(&events_path)?;
+        }
+
+        if metadata_path.exists() {
+            std::fs::remove_file(&metadata_path)?;
+        }
+
+        let events = vec![CdcEvent {
+            lsn: "0/100".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 1".to_string(),
+        }];
+
+        write_cdc_events_jsonl_atomic(&events_path, &events)?;
+
+        let mut metadata = create_cdc_stage_batch_metadata("test_slot", &events_path, &events)
+            .expect("expected metadata");
+
+        metadata.status = CdcStageBatchStatus::Written;
+
+        save_cdc_stage_batch_metadata(&metadata_path, &metadata)?;
+
+        let writer = PanicCdcEventWriter;
+
+        deliver_cdc_stage_batch(&metadata_path, &writer).await?;
+
+        let loaded = load_cdc_stage_batch_metadata(&metadata_path)?.expect("expected metadata");
+
+        assert_eq!(loaded.status, CdcStageBatchStatus::Written);
+        assert_eq!(loaded.retry_count, 0);
+        assert_eq!(loaded.last_error, None);
 
         std::fs::remove_file(&events_path)?;
         std::fs::remove_file(&metadata_path)?;
