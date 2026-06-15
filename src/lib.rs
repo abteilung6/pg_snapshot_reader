@@ -77,6 +77,24 @@ impl SnapshotRowWriter for ClickHouseSnapshotRowWriter {
     }
 }
 
+#[async_trait]
+pub trait CdcEventWriter {
+    async fn write_events(&self, events: &[CdcEvent]) -> anyhow::Result<()>;
+}
+
+pub struct DebugCdcEventWriter;
+
+#[async_trait]
+impl CdcEventWriter for DebugCdcEventWriter {
+    async fn write_events(&self, events: &[CdcEvent]) -> anyhow::Result<()> {
+        for event in events {
+            println!("{:#?}", event);
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotCheckpoint {
     pub table_name: String,
@@ -1167,6 +1185,37 @@ pub fn validate_cdc_stage_batch(metadata: &CdcStageBatchMetadata) -> anyhow::Res
     Ok(events)
 }
 
+pub async fn deliver_cdc_stage_batch<W>(metadata_path: &Path, writer: &W) -> anyhow::Result<()>
+where
+    W: CdcEventWriter + Sync,
+{
+    let metadata =
+        load_cdc_stage_batch_metadata(metadata_path)?.expect("expected CDC stage batch metadata");
+
+    let events = validate_cdc_stage_batch(&metadata)?;
+
+    update_cdc_stage_batch_status(metadata_path, CdcStageBatchStatus::Writing, None)?;
+
+    let write_result = writer.write_events(&events).await;
+
+    match write_result {
+        Ok(()) => {
+            update_cdc_stage_batch_status(metadata_path, CdcStageBatchStatus::Written, None)?;
+
+            Ok(())
+        }
+        Err(error) => {
+            update_cdc_stage_batch_status(
+                metadata_path,
+                CdcStageBatchStatus::Failed,
+                Some(error.to_string()),
+            )?;
+
+            Err(error)
+        }
+    }
+}
+
 pub async fn execute_clickhouse_query(
     config: &ClickHouseConfig,
     query: &str,
@@ -1899,6 +1948,144 @@ mod tests {
         assert!(result.is_err());
 
         std::fs::remove_file(&events_path)?;
+
+        Ok(())
+    }
+
+    struct CountingCdcEventWriter {
+        pub expected_count: usize,
+    }
+
+    #[async_trait]
+    impl CdcEventWriter for CountingCdcEventWriter {
+        async fn write_events(&self, events: &[CdcEvent]) -> anyhow::Result<()> {
+            assert_eq!(events.len(), self.expected_count);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn delivers_cdc_stage_batch_and_marks_it_written() -> anyhow::Result<()> {
+        let events_path = std::env::temp_dir().join("pg_snapshot_reader_deliver_cdc_events.jsonl");
+
+        let metadata_path =
+            std::env::temp_dir().join("pg_snapshot_reader_deliver_cdc_events.meta.json");
+
+        if events_path.exists() {
+            std::fs::remove_file(&events_path)?;
+        }
+
+        if metadata_path.exists() {
+            std::fs::remove_file(&metadata_path)?;
+        }
+
+        let events = vec![
+            CdcEvent {
+                lsn: "0/100".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Begin,
+                table_name: None,
+                column_values: HashMap::new(),
+                raw_data: "BEGIN 1".to_string(),
+            },
+            CdcEvent {
+                lsn: "0/120".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Insert,
+                table_name: Some("public.users".to_string()),
+                column_values: HashMap::from([(
+                    "id".to_string(),
+                    SnapshotValue::String("1".to_string()),
+                )]),
+                raw_data: "table public.users: INSERT: id[integer]:1".to_string(),
+            },
+            CdcEvent {
+                lsn: "0/150".to_string(),
+                xid: "1".to_string(),
+                kind: CdcEventKind::Commit,
+                table_name: None,
+                column_values: HashMap::new(),
+                raw_data: "COMMIT 1".to_string(),
+            },
+        ];
+
+        write_cdc_events_jsonl_atomic(&events_path, &events)?;
+
+        let metadata = create_cdc_stage_batch_metadata("test_slot", &events_path, &events)
+            .expect("expected metadata");
+
+        save_cdc_stage_batch_metadata(&metadata_path, &metadata)?;
+
+        let writer = CountingCdcEventWriter { expected_count: 3 };
+
+        deliver_cdc_stage_batch(&metadata_path, &writer).await?;
+
+        let loaded = load_cdc_stage_batch_metadata(&metadata_path)?.expect("expected metadata");
+
+        assert_eq!(loaded.status, CdcStageBatchStatus::Written);
+        assert_eq!(loaded.retry_count, 0);
+        assert_eq!(loaded.last_error, None);
+
+        std::fs::remove_file(&events_path)?;
+        std::fs::remove_file(&metadata_path)?;
+
+        Ok(())
+    }
+
+    struct FailingCdcEventWriter;
+
+    #[async_trait]
+    impl CdcEventWriter for FailingCdcEventWriter {
+        async fn write_events(&self, _events: &[CdcEvent]) -> anyhow::Result<()> {
+            anyhow::bail!("target unavailable")
+        }
+    }
+
+    #[tokio::test]
+    async fn marks_cdc_stage_batch_failed_when_delivery_fails() -> anyhow::Result<()> {
+        let events_path = std::env::temp_dir().join("pg_snapshot_reader_failed_cdc_events.jsonl");
+
+        let metadata_path =
+            std::env::temp_dir().join("pg_snapshot_reader_failed_cdc_events.meta.json");
+
+        if events_path.exists() {
+            std::fs::remove_file(&events_path)?;
+        }
+
+        if metadata_path.exists() {
+            std::fs::remove_file(&metadata_path)?;
+        }
+
+        let events = vec![CdcEvent {
+            lsn: "0/100".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 1".to_string(),
+        }];
+
+        write_cdc_events_jsonl_atomic(&events_path, &events)?;
+
+        let metadata = create_cdc_stage_batch_metadata("test_slot", &events_path, &events)
+            .expect("expected metadata");
+
+        save_cdc_stage_batch_metadata(&metadata_path, &metadata)?;
+
+        let writer = FailingCdcEventWriter;
+
+        let result = deliver_cdc_stage_batch(&metadata_path, &writer).await;
+
+        assert!(result.is_err());
+
+        let loaded = load_cdc_stage_batch_metadata(&metadata_path)?.expect("expected metadata");
+
+        assert_eq!(loaded.status, CdcStageBatchStatus::Failed);
+        assert_eq!(loaded.retry_count, 1);
+        assert_eq!(loaded.last_error, Some("target unavailable".to_string()));
+
+        std::fs::remove_file(&events_path)?;
+        std::fs::remove_file(&metadata_path)?;
 
         Ok(())
     }
