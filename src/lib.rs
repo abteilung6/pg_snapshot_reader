@@ -95,6 +95,40 @@ impl CdcEventWriter for DebugCdcEventWriter {
     }
 }
 
+pub struct ClickHouseCdcEventWriter {
+    pub config: ClickHouseConfig,
+    pub table_name: String,
+}
+
+#[async_trait]
+impl CdcEventWriter for ClickHouseCdcEventWriter {
+    async fn write_events(&self, events: &[CdcEvent]) -> anyhow::Result<()> {
+        let rows: Vec<SnapshotRow> = events
+            .iter()
+            .filter(|event| event.kind == CdcEventKind::Insert)
+            .map(|event| SnapshotRow {
+                values: event.column_values.clone(),
+            })
+            .collect();
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let payload = build_clickhouse_json_each_row_payload(&rows)?;
+
+        let query = format!(
+            "INSERT INTO {} FORMAT JSONEachRow\n{}",
+            quote_clickhouse_identifier(&self.table_name),
+            payload
+        );
+
+        execute_clickhouse_query(&self.config, &query).await?;
+
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotCheckpoint {
     pub table_name: String,
