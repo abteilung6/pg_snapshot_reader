@@ -1360,6 +1360,26 @@ pub async fn execute_clickhouse_query(
     Ok(())
 }
 
+pub async fn deliver_pending_cdc_stage_batches<W>(
+    stage_dir: &Path,
+    writer: &W,
+) -> anyhow::Result<usize>
+where
+    W: CdcEventWriter + Sync,
+{
+    let metadata = list_deliverable_cdc_stage_batch_metadata(stage_dir)?;
+    let mut delivered_count = 0;
+
+    for batch_metadata in metadata {
+        let paths = create_cdc_stage_batch_paths(stage_dir, &batch_metadata.batch_id);
+
+        deliver_cdc_stage_batch(&paths.metadata_path, writer).await?;
+        delivered_count += 1;
+    }
+
+    Ok(delivered_count)
+}
+
 pub async fn fetch_clickhouse_query(
     config: &ClickHouseConfig,
     query: &str,
@@ -2547,6 +2567,103 @@ mod tests {
         assert_eq!(deliverable.len(), 2);
         assert_eq!(deliverable[0], pending_metadata);
         assert_eq!(deliverable[1], failed_metadata);
+
+        std::fs::remove_dir_all(&stage_dir)?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delivers_pending_cdc_stage_batches() -> anyhow::Result<()> {
+        let stage_dir =
+            std::env::temp_dir().join("pg_snapshot_reader_deliver_pending_cdc_stage_batches_test");
+
+        if stage_dir.exists() {
+            std::fs::remove_dir_all(&stage_dir)?;
+        }
+
+        std::fs::create_dir_all(&stage_dir)?;
+
+        let events_a = vec![CdcEvent {
+            lsn: "0/100".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 1".to_string(),
+        }];
+
+        let events_b = vec![CdcEvent {
+            lsn: "0/200".to_string(),
+            xid: "2".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 2".to_string(),
+        }];
+
+        let metadata_a =
+            write_cdc_stage_batch(&stage_dir, "test_slot", &events_a)?.expect("expected metadata");
+
+        let metadata_b =
+            write_cdc_stage_batch(&stage_dir, "test_slot", &events_b)?.expect("expected metadata");
+
+        let writer = CountingCdcEventWriter { expected_count: 1 };
+
+        let delivered_count = deliver_pending_cdc_stage_batches(&stage_dir, &writer).await?;
+
+        assert_eq!(delivered_count, 2);
+
+        let paths_a = create_cdc_stage_batch_paths(&stage_dir, &metadata_a.batch_id);
+        let paths_b = create_cdc_stage_batch_paths(&stage_dir, &metadata_b.batch_id);
+
+        let loaded_a =
+            load_cdc_stage_batch_metadata(&paths_a.metadata_path)?.expect("expected metadata");
+        let loaded_b =
+            load_cdc_stage_batch_metadata(&paths_b.metadata_path)?.expect("expected metadata");
+
+        assert_eq!(loaded_a.status, CdcStageBatchStatus::Written);
+        assert_eq!(loaded_b.status, CdcStageBatchStatus::Written);
+
+        std::fs::remove_dir_all(&stage_dir)?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deliver_pending_cdc_stage_batches_skips_written_batches() -> anyhow::Result<()> {
+        let stage_dir =
+            std::env::temp_dir().join("pg_snapshot_reader_skip_written_pending_delivery_test");
+
+        if stage_dir.exists() {
+            std::fs::remove_dir_all(&stage_dir)?;
+        }
+
+        std::fs::create_dir_all(&stage_dir)?;
+
+        let events = vec![CdcEvent {
+            lsn: "0/100".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: HashMap::new(),
+            raw_data: "BEGIN 1".to_string(),
+        }];
+
+        let mut metadata =
+            write_cdc_stage_batch(&stage_dir, "test_slot", &events)?.expect("expected metadata");
+
+        metadata.status = CdcStageBatchStatus::Written;
+
+        let paths = create_cdc_stage_batch_paths(&stage_dir, &metadata.batch_id);
+
+        save_cdc_stage_batch_metadata(&paths.metadata_path, &metadata)?;
+
+        let writer = PanicCdcEventWriter;
+
+        let delivered_count = deliver_pending_cdc_stage_batches(&stage_dir, &writer).await?;
+
+        assert_eq!(delivered_count, 0);
 
         std::fs::remove_dir_all(&stage_dir)?;
 
