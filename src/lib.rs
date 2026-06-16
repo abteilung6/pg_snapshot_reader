@@ -79,14 +79,24 @@ impl SnapshotRowWriter for ClickHouseSnapshotRowWriter {
 
 #[async_trait]
 pub trait CdcEventWriter {
-    async fn write_events(&self, events: &[CdcEvent]) -> anyhow::Result<()>;
+    async fn write_events(
+        &self,
+        metadata: &CdcStageBatchMetadata,
+        events: &[CdcEvent],
+    ) -> anyhow::Result<()>;
 }
 
 pub struct DebugCdcEventWriter;
 
 #[async_trait]
 impl CdcEventWriter for DebugCdcEventWriter {
-    async fn write_events(&self, events: &[CdcEvent]) -> anyhow::Result<()> {
+    async fn write_events(
+        &self,
+        metadata: &CdcStageBatchMetadata,
+        events: &[CdcEvent],
+    ) -> anyhow::Result<()> {
+        println!("{:#?}", metadata);
+
         for event in events {
             println!("{:#?}", event);
         }
@@ -102,12 +112,33 @@ pub struct ClickHouseCdcEventWriter {
 
 #[async_trait]
 impl CdcEventWriter for ClickHouseCdcEventWriter {
-    async fn write_events(&self, events: &[CdcEvent]) -> anyhow::Result<()> {
+    async fn write_events(
+        &self,
+        metadata: &CdcStageBatchMetadata,
+        events: &[CdcEvent],
+    ) -> anyhow::Result<()> {
         let rows: Vec<SnapshotRow> = events
             .iter()
             .filter(|event| event.kind == CdcEventKind::Insert)
-            .map(|event| SnapshotRow {
-                values: event.column_values.clone(),
+            .map(|event| {
+                let mut values = event.column_values.clone();
+
+                values.insert(
+                    "_source_lsn".to_string(),
+                    SnapshotValue::String(event.lsn.clone()),
+                );
+
+                values.insert(
+                    "_replication_batch_id".to_string(),
+                    SnapshotValue::String(metadata.batch_id.clone()),
+                );
+
+                values.insert(
+                    "_replication_deleted".to_string(),
+                    SnapshotValue::String("0".to_string()),
+                );
+
+                SnapshotRow { values }
             })
             .collect();
 
@@ -1248,11 +1279,9 @@ where
         return Ok(());
     }
 
-    let events = batch.events;
-
     update_cdc_stage_batch_status(metadata_path, CdcStageBatchStatus::Writing, None)?;
 
-    let write_result = writer.write_events(&events).await;
+    let write_result = writer.write_events(&batch.metadata, &batch.events).await;
 
     match write_result {
         Ok(()) => {
@@ -2139,7 +2168,11 @@ mod tests {
 
     #[async_trait]
     impl CdcEventWriter for CountingCdcEventWriter {
-        async fn write_events(&self, events: &[CdcEvent]) -> anyhow::Result<()> {
+        async fn write_events(
+            &self,
+            _metadata: &CdcStageBatchMetadata,
+            events: &[CdcEvent],
+        ) -> anyhow::Result<()> {
             assert_eq!(events.len(), self.expected_count);
             Ok(())
         }
@@ -2217,7 +2250,11 @@ mod tests {
 
     #[async_trait]
     impl CdcEventWriter for FailingCdcEventWriter {
-        async fn write_events(&self, _events: &[CdcEvent]) -> anyhow::Result<()> {
+        async fn write_events(
+            &self,
+            _metadata: &CdcStageBatchMetadata,
+            _events: &[CdcEvent],
+        ) -> anyhow::Result<()> {
             anyhow::bail!("target unavailable")
         }
     }
@@ -2275,7 +2312,11 @@ mod tests {
 
     #[async_trait]
     impl CdcEventWriter for PanicCdcEventWriter {
-        async fn write_events(&self, _events: &[CdcEvent]) -> anyhow::Result<()> {
+        async fn write_events(
+            &self,
+            _metadata: &CdcStageBatchMetadata,
+            _events: &[CdcEvent],
+        ) -> anyhow::Result<()> {
             panic!("writer should not be called for already written batches");
         }
     }

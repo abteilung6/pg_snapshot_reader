@@ -8,10 +8,11 @@ use pg_snapshot_reader::{
     create_clickhouse_snapshot_table, create_logical_replication_slot,
     create_logical_replication_slot_with_plugin, create_publication_for_table,
     deliver_cdc_stage_batch, discover_table_schema, execute_clickhouse_query,
-    load_cdc_stage_batch_metadata, parse_decoded_wal_changes, read_decoded_wal_changes,
-    read_decoded_wal_changes_into_stage, read_snapshot_rows_batch, read_snapshot_rows_full,
-    read_snapshot_rows_full_with_checkpoint, read_snapshot_rows_full_with_stage_and_checkpoint,
-    validate_cdc_stage_batch, write_cdc_stage_batch, write_staged_snapshot_rows,
+    fetch_clickhouse_query, load_cdc_stage_batch_metadata, parse_decoded_wal_changes,
+    read_decoded_wal_changes, read_decoded_wal_changes_into_stage, read_snapshot_rows_batch,
+    read_snapshot_rows_full, read_snapshot_rows_full_with_checkpoint,
+    read_snapshot_rows_full_with_stage_and_checkpoint, validate_cdc_stage_batch,
+    write_cdc_stage_batch, write_staged_snapshot_rows,
 };
 use tokio_postgres::{Client, Error, NoTls};
 
@@ -905,7 +906,10 @@ async fn writes_staged_cdc_insert_events_to_clickhouse() -> anyhow::Result<()> {
             "
             CREATE TABLE {} (
                 id Int32,
-                name String
+                name String,
+                _source_lsn String,
+                _replication_batch_id String,
+                _replication_deleted UInt8
             )
             ENGINE = MergeTree
             ORDER BY id
@@ -968,6 +972,25 @@ async fn writes_staged_cdc_insert_events_to_clickhouse() -> anyhow::Result<()> {
         load_cdc_stage_batch_metadata(&paths.metadata_path)?.expect("expected metadata");
 
     assert_eq!(loaded_metadata.status, CdcStageBatchStatus::Written);
+
+    let batch_id = fetch_clickhouse_query(
+        &clickhouse_config,
+        &format!(
+            "SELECT _replication_batch_id FROM {} LIMIT 1",
+            clickhouse_table_name
+        ),
+    )
+    .await?;
+
+    assert!(batch_id.contains(&metadata.batch_id));
+
+    let source_lsn = fetch_clickhouse_query(
+        &clickhouse_config,
+        &format!("SELECT _source_lsn FROM {} LIMIT 1", clickhouse_table_name),
+    )
+    .await?;
+
+    assert!(source_lsn.contains("0/120"));
 
     execute_clickhouse_query(
         &clickhouse_config,
