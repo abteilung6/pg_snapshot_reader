@@ -874,6 +874,54 @@ pub fn build_clickhouse_create_snapshot_table_query(
     )
 }
 
+pub fn build_clickhouse_create_cdc_table_query(
+    schema: &TableSchema,
+    clickhouse_table: &str,
+) -> anyhow::Result<String> {
+    let mut column_definitions = Vec::new();
+
+    for column in &schema.columns {
+        let clickhouse_type = map_postgres_type_to_clickhouse_type(&column.postgres_type)?;
+
+        column_definitions.push(format!(
+            "{} {}",
+            quote_clickhouse_identifier(&column.name),
+            clickhouse_type
+        ));
+    }
+
+    column_definitions.push("_source_lsn String".to_string());
+    column_definitions.push("_replication_batch_id String".to_string());
+    column_definitions.push("_replication_deleted UInt8".to_string());
+
+    let primary_key_column = schema.primary_key_column();
+
+    Ok(format!(
+        "
+        CREATE TABLE IF NOT EXISTS {} (
+            {}
+        )
+        ENGINE = MergeTree
+        ORDER BY {}
+        ",
+        quote_clickhouse_identifier(clickhouse_table),
+        column_definitions.join(",\n            "),
+        quote_clickhouse_identifier(&primary_key_column.name),
+    ))
+}
+
+pub async fn create_clickhouse_cdc_table(
+    config: &ClickHouseConfig,
+    schema: &TableSchema,
+    clickhouse_table: &str,
+) -> anyhow::Result<()> {
+    let query = build_clickhouse_create_cdc_table_query(schema, clickhouse_table)?;
+
+    execute_clickhouse_query(config, &query).await?;
+
+    Ok(())
+}
+
 pub fn build_clickhouse_insert_query(
     table_name: &str,
     rows: &[SnapshotRow],
@@ -2741,6 +2789,39 @@ mod tests {
         assert_eq!(delivered_count, 0);
 
         std::fs::remove_dir_all(&stage_dir)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn builds_clickhouse_create_cdc_table_query_with_replication_columns() -> anyhow::Result<()> {
+        let schema = TableSchema {
+            table_name: "users".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    postgres_type: "integer".to_string(),
+                    is_nullable: false,
+                    is_primary_key: true,
+                },
+                Column {
+                    name: "name".to_string(),
+                    postgres_type: "text".to_string(),
+                    is_nullable: false,
+                    is_primary_key: false,
+                },
+            ],
+        };
+
+        let query = build_clickhouse_create_cdc_table_query(&schema, "users_cdc")?;
+
+        assert!(query.contains("CREATE TABLE IF NOT EXISTS `users_cdc`"));
+        assert!(query.contains("`id` Int32"));
+        assert!(query.contains("`name` String"));
+        assert!(query.contains("_source_lsn String"));
+        assert!(query.contains("_replication_batch_id String"));
+        assert!(query.contains("_replication_deleted UInt8"));
+        assert!(query.contains("ORDER BY `id`"));
 
         Ok(())
     }
