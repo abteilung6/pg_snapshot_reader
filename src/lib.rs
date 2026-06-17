@@ -119,7 +119,9 @@ impl CdcEventWriter for ClickHouseCdcEventWriter {
     ) -> anyhow::Result<()> {
         let rows: Vec<SnapshotRow> = events
             .iter()
-            .filter(|event| event.kind == CdcEventKind::Insert)
+            .filter(|event| {
+                event.kind == CdcEventKind::Insert || event.kind == CdcEventKind::Delete
+            })
             .map(|event| {
                 let mut values = event.column_values.clone();
 
@@ -133,9 +135,15 @@ impl CdcEventWriter for ClickHouseCdcEventWriter {
                     SnapshotValue::String(metadata.batch_id.clone()),
                 );
 
+                let deleted = if event.kind == CdcEventKind::Delete {
+                    "1"
+                } else {
+                    "0"
+                };
+
                 values.insert(
                     "_replication_deleted".to_string(),
-                    SnapshotValue::String("0".to_string()),
+                    SnapshotValue::String(deleted.to_string()),
                 );
 
                 SnapshotRow { values }
@@ -523,10 +531,10 @@ pub fn parse_decoded_wal_change(change: DecodedWalChange) -> CdcEvent {
     };
 
     let table_name = extract_table_name_from_decoded_change(&change.data);
-    let column_values = if kind == CdcEventKind::Insert {
-        extract_insert_column_values_from_decoded_change(&change.data)
-    } else {
-        HashMap::new()
+    let column_values = match kind {
+        CdcEventKind::Insert => extract_insert_column_values_from_decoded_change(&change.data),
+        CdcEventKind::Delete => extract_delete_column_values_from_decoded_change(&change.data),
+        _ => HashMap::new(),
     };
 
     CdcEvent {
@@ -556,6 +564,35 @@ pub fn extract_insert_column_values_from_decoded_change(
     let mut values = HashMap::new();
 
     let Some((_prefix, columns_part)) = data.split_once(": INSERT:") else {
+        return values;
+    };
+
+    for column_part in columns_part.trim().split(' ') {
+        let Some((column_with_type, raw_value)) = column_part.split_once(':') else {
+            continue;
+        };
+
+        let Some((column_name, _type_part)) = column_with_type.split_once('[') else {
+            continue;
+        };
+
+        let value = raw_value.trim_matches('\'');
+
+        values.insert(
+            column_name.to_string(),
+            SnapshotValue::String(value.to_string()),
+        );
+    }
+
+    values
+}
+
+pub fn extract_delete_column_values_from_decoded_change(
+    data: &str,
+) -> HashMap<String, SnapshotValue> {
+    let mut values = HashMap::new();
+
+    let Some((_prefix, columns_part)) = data.split_once(": DELETE:") else {
         return values;
     };
 
@@ -2849,5 +2886,36 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn extracts_column_values_from_decoded_delete_change() {
+        let values = extract_delete_column_values_from_decoded_change(
+            "table public.users: DELETE: id[integer]:1",
+        );
+
+        assert_eq!(
+            values.get("id"),
+            Some(&SnapshotValue::String("1".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_delete_decoded_wal_change_with_column_values() {
+        let change = DecodedWalChange {
+            lsn: "0/16B6C75".to_string(),
+            xid: "123".to_string(),
+            data: "table public.users: DELETE: id[integer]:1".to_string(),
+        };
+
+        let event = parse_decoded_wal_change(change);
+
+        assert_eq!(event.kind, CdcEventKind::Delete);
+        assert_eq!(event.table_name, Some("public.users".to_string()));
+
+        assert_eq!(
+            event.column_values.get("id"),
+            Some(&SnapshotValue::String("1".to_string()))
+        );
     }
 }
