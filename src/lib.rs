@@ -822,6 +822,14 @@ pub fn map_postgres_type_to_clickhouse_type(postgres_type: &str) -> anyhow::Resu
     }
 }
 
+pub fn map_postgres_type_to_nullable_clickhouse_type(
+    postgres_type: &str,
+) -> anyhow::Result<String> {
+    let clickhouse_type = map_postgres_type_to_clickhouse_type(postgres_type)?;
+
+    Ok(format!("Nullable({})", clickhouse_type))
+}
+
 pub fn build_select_query(schema: &TableSchema) -> String {
     let column_names = schema
         .columns
@@ -881,7 +889,7 @@ pub fn build_clickhouse_create_cdc_table_query(
     let mut column_definitions = Vec::new();
 
     for column in &schema.columns {
-        let clickhouse_type = map_postgres_type_to_clickhouse_type(&column.postgres_type)?;
+        let clickhouse_type = map_postgres_type_to_nullable_clickhouse_type(&column.postgres_type)?;
 
         column_definitions.push(format!(
             "{} {}",
@@ -894,19 +902,16 @@ pub fn build_clickhouse_create_cdc_table_query(
     column_definitions.push("_replication_batch_id String".to_string());
     column_definitions.push("_replication_deleted UInt8".to_string());
 
-    let primary_key_column = schema.primary_key_column();
-
     Ok(format!(
         "
         CREATE TABLE IF NOT EXISTS {} (
             {}
         )
         ENGINE = MergeTree
-        ORDER BY {}
+        ORDER BY (_replication_batch_id, _source_lsn)
         ",
         quote_clickhouse_identifier(clickhouse_table),
-        column_definitions.join(",\n            "),
-        quote_clickhouse_identifier(&primary_key_column.name),
+        column_definitions.join(",\n            ")
     ))
 }
 
@@ -2816,12 +2821,32 @@ mod tests {
         let query = build_clickhouse_create_cdc_table_query(&schema, "users_cdc")?;
 
         assert!(query.contains("CREATE TABLE IF NOT EXISTS `users_cdc`"));
-        assert!(query.contains("`id` Int32"));
-        assert!(query.contains("`name` String"));
+        assert!(query.contains("`id` Nullable(Int32)"));
+        assert!(query.contains("`name` Nullable(String)"));
         assert!(query.contains("_source_lsn String"));
         assert!(query.contains("_replication_batch_id String"));
         assert!(query.contains("_replication_deleted UInt8"));
-        assert!(query.contains("ORDER BY `id`"));
+        assert!(query.contains("ORDER BY (_replication_batch_id, _source_lsn)"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn maps_postgres_type_to_nullable_clickhouse_type() -> anyhow::Result<()> {
+        assert_eq!(
+            map_postgres_type_to_nullable_clickhouse_type("integer")?,
+            "Nullable(Int32)"
+        );
+
+        assert_eq!(
+            map_postgres_type_to_nullable_clickhouse_type("text")?,
+            "Nullable(String)"
+        );
+
+        assert_eq!(
+            map_postgres_type_to_nullable_clickhouse_type("timestamp without time zone")?,
+            "Nullable(DateTime64(3))"
+        );
 
         Ok(())
     }
