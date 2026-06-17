@@ -5,7 +5,7 @@ use pg_snapshot_reader::{
     CdcEvent, CdcEventKind, CdcStageBatchStatus, ClickHouseCdcEventWriter, ClickHouseConfig,
     ClickHouseSnapshotRowWriter, SnapshotCheckpoint, SnapshotValue,
     check_postgres_cdc_prerequisites, count_clickhouse_rows, create_cdc_stage_batch_paths,
-    create_clickhouse_snapshot_table, create_logical_replication_slot,
+    create_clickhouse_cdc_table, create_clickhouse_snapshot_table, create_logical_replication_slot,
     create_logical_replication_slot_with_plugin, create_publication_for_table,
     deliver_cdc_stage_batch, discover_table_schema, execute_clickhouse_query,
     fetch_clickhouse_query, load_cdc_stage_batch_metadata, parse_decoded_wal_changes,
@@ -876,6 +876,8 @@ async fn reads_decoded_wal_changes_into_cdc_stage() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn writes_staged_cdc_insert_events_to_clickhouse() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+
     let table_name = unique_table_name();
     let clickhouse_table_name = format!("{}_cdc", table_name);
 
@@ -900,24 +902,20 @@ async fn writes_staged_cdc_insert_events_to_clickhouse() -> anyhow::Result<()> {
     )
     .await?;
 
-    execute_clickhouse_query(
-        &clickhouse_config,
-        &format!(
-            "
-            CREATE TABLE {} (
-                id Int32,
-                name String,
-                _source_lsn String,
-                _replication_batch_id String,
-                _replication_deleted UInt8
-            )
-            ENGINE = MergeTree
-            ORDER BY id
-            ",
-            clickhouse_table_name
-        ),
-    )
-    .await?;
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+    client.execute(&create_table_sql, &[]).await?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+
+    create_clickhouse_cdc_table(&clickhouse_config, &schema, &clickhouse_table_name).await?;
 
     let events = vec![
         CdcEvent {
@@ -932,7 +930,7 @@ async fn writes_staged_cdc_insert_events_to_clickhouse() -> anyhow::Result<()> {
             lsn: "0/120".to_string(),
             xid: "1".to_string(),
             kind: CdcEventKind::Insert,
-            table_name: Some("public.users".to_string()),
+            table_name: Some(format!("public.{}", table_name)),
             column_values: std::collections::HashMap::from([
                 ("id".to_string(), SnapshotValue::String("1".to_string())),
                 (
@@ -940,7 +938,10 @@ async fn writes_staged_cdc_insert_events_to_clickhouse() -> anyhow::Result<()> {
                     SnapshotValue::String("Alice".to_string()),
                 ),
             ]),
-            raw_data: "table public.users: INSERT: id[integer]:1 name[text]:'Alice'".to_string(),
+            raw_data: format!(
+                "table public.{}: INSERT: id[integer]:1 name[text]:'Alice'",
+                table_name
+            ),
         },
         CdcEvent {
             lsn: "0/150".to_string(),
@@ -968,11 +969,6 @@ async fn writes_staged_cdc_insert_events_to_clickhouse() -> anyhow::Result<()> {
 
     assert_eq!(row_count, 1);
 
-    let loaded_metadata =
-        load_cdc_stage_batch_metadata(&paths.metadata_path)?.expect("expected metadata");
-
-    assert_eq!(loaded_metadata.status, CdcStageBatchStatus::Written);
-
     let batch_id = fetch_clickhouse_query(
         &clickhouse_config,
         &format!(
@@ -992,11 +988,19 @@ async fn writes_staged_cdc_insert_events_to_clickhouse() -> anyhow::Result<()> {
 
     assert!(source_lsn.contains("0/120"));
 
+    let loaded_metadata =
+        load_cdc_stage_batch_metadata(&paths.metadata_path)?.expect("expected metadata");
+
+    assert_eq!(loaded_metadata.status, CdcStageBatchStatus::Written);
+
     execute_clickhouse_query(
         &clickhouse_config,
         &format!("DROP TABLE IF EXISTS {}", clickhouse_table_name),
     )
     .await?;
+
+    let drop_postgres_table_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_postgres_table_sql, &[]).await?;
 
     if stage_dir.exists() {
         std::fs::remove_dir_all(&stage_dir)?;
