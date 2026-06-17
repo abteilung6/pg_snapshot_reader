@@ -120,7 +120,9 @@ impl CdcEventWriter for ClickHouseCdcEventWriter {
         let rows: Vec<SnapshotRow> = events
             .iter()
             .filter(|event| {
-                event.kind == CdcEventKind::Insert || event.kind == CdcEventKind::Delete
+                event.kind == CdcEventKind::Insert
+                    || event.kind == CdcEventKind::Delete
+                    || event.kind == CdcEventKind::Update
             })
             .map(|event| {
                 let mut values = event.column_values.clone();
@@ -534,6 +536,7 @@ pub fn parse_decoded_wal_change(change: DecodedWalChange) -> CdcEvent {
     let column_values = match kind {
         CdcEventKind::Insert => extract_insert_column_values_from_decoded_change(&change.data),
         CdcEventKind::Delete => extract_delete_column_values_from_decoded_change(&change.data),
+        CdcEventKind::Update => extract_update_column_values_from_decoded_change(&change.data),
         _ => HashMap::new(),
     };
 
@@ -593,6 +596,35 @@ pub fn extract_delete_column_values_from_decoded_change(
     let mut values = HashMap::new();
 
     let Some((_prefix, columns_part)) = data.split_once(": DELETE:") else {
+        return values;
+    };
+
+    for column_part in columns_part.trim().split(' ') {
+        let Some((column_with_type, raw_value)) = column_part.split_once(':') else {
+            continue;
+        };
+
+        let Some((column_name, _type_part)) = column_with_type.split_once('[') else {
+            continue;
+        };
+
+        let value = raw_value.trim_matches('\'');
+
+        values.insert(
+            column_name.to_string(),
+            SnapshotValue::String(value.to_string()),
+        );
+    }
+
+    values
+}
+
+pub fn extract_update_column_values_from_decoded_change(
+    data: &str,
+) -> HashMap<String, SnapshotValue> {
+    let mut values = HashMap::new();
+
+    let Some((_prefix, columns_part)) = data.split_once(": UPDATE:") else {
         return values;
     };
 
@@ -1855,8 +1887,7 @@ mod tests {
         let change = DecodedWalChange {
             lsn: "0/16B6C70".to_string(),
             xid: "123".to_string(),
-            data: "table public.users: UPDATE: id[integer]:1 name[text]:'Alice Updated'"
-                .to_string(),
+            data: "table public.users: UPDATE: id[integer]:1 name[text]:'AliceUpdated'".to_string(),
         };
 
         let event = parse_decoded_wal_change(change);
@@ -1875,6 +1906,30 @@ mod tests {
         let event = parse_decoded_wal_change(change);
 
         assert_eq!(event.kind, CdcEventKind::Delete);
+    }
+
+    #[test]
+    fn parses_update_decoded_wal_change_with_column_values() {
+        let change = DecodedWalChange {
+            lsn: "0/16B6C70".to_string(),
+            xid: "123".to_string(),
+            data: "table public.users: UPDATE: id[integer]:1 name[text]:'AliceUpdated'".to_string(),
+        };
+
+        let event = parse_decoded_wal_change(change);
+
+        assert_eq!(event.kind, CdcEventKind::Update);
+        assert_eq!(event.table_name, Some("public.users".to_string()));
+
+        assert_eq!(
+            event.column_values.get("id"),
+            Some(&SnapshotValue::String("1".to_string()))
+        );
+
+        assert_eq!(
+            event.column_values.get("name"),
+            Some(&SnapshotValue::String("AliceUpdated".to_string()))
+        );
     }
 
     #[test]
@@ -2916,6 +2971,23 @@ mod tests {
         assert_eq!(
             event.column_values.get("id"),
             Some(&SnapshotValue::String("1".to_string()))
+        );
+    }
+
+    #[test]
+    fn extracts_column_values_from_decoded_update_change() {
+        let values = extract_update_column_values_from_decoded_change(
+            "table public.users: UPDATE: id[integer]:1 name[text]:'AliceUpdated'",
+        );
+
+        assert_eq!(
+            values.get("id"),
+            Some(&SnapshotValue::String("1".to_string()))
+        );
+
+        assert_eq!(
+            values.get("name"),
+            Some(&SnapshotValue::String("AliceUpdated".to_string()))
         );
     }
 }
