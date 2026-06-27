@@ -1,10 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use pg_snapshot_reader::{
-    CdcEvent, CdcEventKind, CdcStageBatchStatus, ClickHouseCdcEventWriter, ClickHouseConfig,
-    ClickHouseSnapshotRowWriter, SnapshotCheckpoint, SnapshotValue,
-    build_clickhouse_cdc_latest_state_query, check_postgres_cdc_prerequisites,
+    CdcEvent, CdcEventKind, CdcEventWriter, CdcStageBatchMetadata, CdcStageBatchStatus,
+    ClickHouseCdcEventWriter, ClickHouseConfig, ClickHouseSnapshotRowWriter, SnapshotCheckpoint,
+    SnapshotValue, build_clickhouse_cdc_latest_state_query, check_postgres_cdc_prerequisites,
     count_clickhouse_rows, create_cdc_stage_batch_paths, create_clickhouse_cdc_table,
     create_clickhouse_snapshot_table, create_logical_replication_slot,
     create_logical_replication_slot_with_plugin, create_publication_for_table,
@@ -28,6 +29,31 @@ fn unique_table_name() -> String {
     let counter = TABLE_COUNTER.fetch_add(1, Ordering::SeqCst);
 
     format!("users_test_{}_{}", millis, counter)
+}
+
+struct SourceTableFilteredCdcEventWriter<W> {
+    source_table_name: String,
+    inner: W,
+}
+
+#[async_trait]
+impl<W> CdcEventWriter for SourceTableFilteredCdcEventWriter<W>
+where
+    W: CdcEventWriter + Sync,
+{
+    async fn write_events(
+        &self,
+        metadata: &CdcStageBatchMetadata,
+        events: &[CdcEvent],
+    ) -> anyhow::Result<()> {
+        let filtered_events = events
+            .iter()
+            .filter(|event| event.table_name.as_deref() == Some(self.source_table_name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        self.inner.write_events(metadata, &filtered_events).await
+    }
 }
 
 async fn connect_to_postgres() -> Result<Client, Error> {
@@ -1722,9 +1748,14 @@ async fn runs_real_postgres_cdc_changes_into_clickhouse() -> anyhow::Result<()> 
 
     let paths = create_cdc_stage_batch_paths(&stage_dir, &metadata.batch_id);
 
-    let writer = ClickHouseCdcEventWriter {
+    let clickhouse_writer = ClickHouseCdcEventWriter {
         config: clickhouse_config.clone(),
         table_name: clickhouse_table_name.clone(),
+    };
+
+    let writer = SourceTableFilteredCdcEventWriter {
+        source_table_name: format!("public.{}", table_name),
+        inner: clickhouse_writer,
     };
 
     deliver_cdc_stage_batch(&paths.metadata_path, &writer).await?;
@@ -1749,6 +1780,184 @@ async fn runs_real_postgres_cdc_changes_into_clickhouse() -> anyhow::Result<()> 
     .await?;
 
     assert!(latest_row_count.contains("0"));
+
+    execute_clickhouse_query(
+        &clickhouse_config,
+        &format!("DROP TABLE IF EXISTS {}", clickhouse_table_name),
+    )
+    .await?;
+
+    let drop_slot_sql = format!("SELECT pg_drop_replication_slot('{}')", slot_name);
+
+    client.query_one(&drop_slot_sql, &[]).await?;
+
+    let drop_postgres_table_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_postgres_table_sql, &[]).await?;
+
+    if stage_dir.exists() {
+        std::fs::remove_dir_all(&stage_dir)?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn runs_snapshot_then_cdc_into_clickhouse() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+
+    let table_name = unique_table_name();
+    let slot_name = format!("{}_slot", table_name);
+    let clickhouse_table_name = format!("{}_snapshot_cdc", table_name);
+
+    let stage_dir = std::env::temp_dir().join(format!("{}_snapshot_cdc_stage", table_name));
+
+    if stage_dir.exists() {
+        std::fs::remove_dir_all(&stage_dir)?;
+    }
+
+    std::fs::create_dir_all(&stage_dir)?;
+
+    let clickhouse_config = ClickHouseConfig {
+        url: "http://localhost:8123".to_string(),
+        database: "snapshot_demo".to_string(),
+        user: "snapshot_user".to_string(),
+        password: "snapshot_password".to_string(),
+    };
+
+    execute_clickhouse_query(
+        &clickhouse_config,
+        &format!("DROP TABLE IF EXISTS {}", clickhouse_table_name),
+    )
+    .await?;
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_table_sql, &[]).await?;
+
+    client
+        .execute(
+            &format!(
+                "
+                INSERT INTO {} (id, name)
+                VALUES
+                    (1, 'Alice'),
+                    (2, 'Bob')
+                ",
+                table_name
+            ),
+            &[],
+        )
+        .await?;
+
+    let create_slot_sql = format!(
+        "
+        SELECT pg_create_logical_replication_slot('{}', 'test_decoding')
+        ",
+        slot_name
+    );
+
+    client.query_one(&create_slot_sql, &[]).await?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+
+    create_clickhouse_cdc_table(&clickhouse_config, &schema, &clickhouse_table_name).await?;
+
+    let snapshot_rows = read_snapshot_rows_batch(&client, &schema, 0, 100).await?;
+
+    let snapshot_events = snapshot_rows
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| CdcEvent {
+            lsn: format!("0/{:X}", index + 1),
+            xid: "snapshot".to_string(),
+            kind: CdcEventKind::Insert,
+            table_name: Some(format!("public.{}", table_name)),
+            column_values: row.values,
+            raw_data: "snapshot row".to_string(),
+        })
+        .collect::<Vec<_>>();
+
+    let snapshot_metadata = write_cdc_stage_batch(&stage_dir, "snapshot", &snapshot_events)?
+        .expect("expected snapshot metadata");
+
+    let snapshot_paths = create_cdc_stage_batch_paths(&stage_dir, &snapshot_metadata.batch_id);
+
+    let clickhouse_writer = ClickHouseCdcEventWriter {
+        config: clickhouse_config.clone(),
+        table_name: clickhouse_table_name.clone(),
+    };
+
+    let writer = SourceTableFilteredCdcEventWriter {
+        source_table_name: format!("public.{}", table_name),
+        inner: clickhouse_writer,
+    };
+
+    deliver_cdc_stage_batch(&snapshot_paths.metadata_path, &writer).await?;
+
+    client
+        .execute(
+            &format!(
+                "UPDATE {} SET name = 'AliceUpdated' WHERE id = 1",
+                table_name
+            ),
+            &[],
+        )
+        .await?;
+
+    client
+        .execute(&format!("DELETE FROM {} WHERE id = 2", table_name), &[])
+        .await?;
+
+    client
+        .execute(
+            &format!(
+                "INSERT INTO {} (id, name) VALUES (3, 'Charlie')",
+                table_name
+            ),
+            &[],
+        )
+        .await?;
+
+    let cdc_metadata = read_decoded_wal_changes_into_stage(&client, &slot_name, 1000, &stage_dir)
+        .await?
+        .expect("expected CDC metadata");
+
+    let cdc_paths = create_cdc_stage_batch_paths(&stage_dir, &cdc_metadata.batch_id);
+
+    deliver_cdc_stage_batch(&cdc_paths.metadata_path, &writer).await?;
+
+    let latest_state_query =
+        build_clickhouse_cdc_latest_state_query(&schema, &clickhouse_table_name);
+
+    let latest_rows = fetch_clickhouse_query(
+        &clickhouse_config,
+        &format!(
+            "
+            SELECT id, name
+            FROM ({})
+            ORDER BY id
+            ",
+            latest_state_query
+        ),
+    )
+    .await?;
+
+    assert!(latest_rows.contains("1"));
+    assert!(latest_rows.contains("AliceUpdated"));
+
+    assert!(latest_rows.contains("3"));
+    assert!(latest_rows.contains("Charlie"));
+
+    assert!(!latest_rows.contains("2"));
+    assert!(!latest_rows.contains("Bob"));
 
     execute_clickhouse_query(
         &clickhouse_config,
