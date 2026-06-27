@@ -989,6 +989,25 @@ async fn writes_staged_cdc_insert_events_to_clickhouse() -> anyhow::Result<()> {
 
     assert!(source_lsn.contains("0/120"));
 
+    let source_lsn_parts = fetch_clickhouse_query(
+        &clickhouse_config,
+        &format!(
+            "
+            SELECT
+                _source_lsn_high,
+                _source_lsn_low
+            FROM {}
+            WHERE _source_lsn = '0/120'
+            LIMIT 1
+            ",
+            clickhouse_table_name
+        ),
+    )
+    .await?;
+
+    assert!(source_lsn_parts.contains("0"));
+    assert!(source_lsn_parts.contains("288"));
+
     let loaded_metadata =
         load_cdc_stage_batch_metadata(&paths.metadata_path)?.expect("expected metadata");
 
@@ -1268,6 +1287,25 @@ async fn writes_staged_cdc_update_events_as_clickhouse_versions() -> anyhow::Res
     .await?;
 
     assert!(latest_name.contains("AliceUpdated"));
+
+    let updated_lsn_parts = fetch_clickhouse_query(
+        &clickhouse_config,
+        &format!(
+            "
+            SELECT
+                _source_lsn_high,
+                _source_lsn_low
+            FROM {}
+            WHERE name = 'AliceUpdated'
+            LIMIT 1
+            ",
+            clickhouse_table_name
+        ),
+    )
+    .await?;
+
+    assert!(updated_lsn_parts.contains("0"));
+    assert!(updated_lsn_parts.contains("384"));
 
     let deleted_flags = fetch_clickhouse_query(
         &clickhouse_config,

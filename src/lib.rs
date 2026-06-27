@@ -121,15 +121,27 @@ impl CdcEventWriter for ClickHouseCdcEventWriter {
             .iter()
             .filter(|event| {
                 event.kind == CdcEventKind::Insert
-                    || event.kind == CdcEventKind::Delete
                     || event.kind == CdcEventKind::Update
+                    || event.kind == CdcEventKind::Delete
             })
             .map(|event| {
+                let parsed_lsn = parse_postgres_lsn(&event.lsn)?;
+
                 let mut values = event.column_values.clone();
 
                 values.insert(
                     "_source_lsn".to_string(),
                     SnapshotValue::String(event.lsn.clone()),
+                );
+
+                values.insert(
+                    "_source_lsn_high".to_string(),
+                    SnapshotValue::String(parsed_lsn.high.to_string()),
+                );
+
+                values.insert(
+                    "_source_lsn_low".to_string(),
+                    SnapshotValue::String(parsed_lsn.low.to_string()),
                 );
 
                 values.insert(
@@ -148,9 +160,9 @@ impl CdcEventWriter for ClickHouseCdcEventWriter {
                     SnapshotValue::String(deleted.to_string()),
                 );
 
-                SnapshotRow { values }
+                Ok(SnapshotRow { values })
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         if rows.is_empty() {
             return Ok(());
