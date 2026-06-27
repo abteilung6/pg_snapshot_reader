@@ -1048,6 +1048,44 @@ pub fn build_clickhouse_insert_query(
     ))
 }
 
+pub fn build_clickhouse_cdc_latest_state_query(schema: &TableSchema, cdc_table: &str) -> String {
+    let primary_key_column = schema.primary_key_column();
+
+    let selected_columns = schema
+        .columns
+        .iter()
+        .map(|column| {
+            format!(
+                "latest.{} AS {}",
+                quote_clickhouse_identifier(&column.name),
+                quote_clickhouse_identifier(&column.name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n        ");
+
+    format!(
+        "
+        SELECT
+            {}
+        FROM (
+            SELECT
+                *,
+                row_number() OVER (
+                    PARTITION BY {}
+                    ORDER BY _source_lsn DESC
+                ) AS row_number
+            FROM {}
+        ) AS latest
+        WHERE row_number = 1
+          AND _replication_deleted = 0
+        ",
+        selected_columns,
+        quote_clickhouse_identifier(&primary_key_column.name),
+        quote_clickhouse_identifier(cdc_table),
+    )
+}
+
 pub fn build_clickhouse_json_each_row_payload(rows: &[SnapshotRow]) -> anyhow::Result<String> {
     let mut lines = Vec::new();
 
@@ -2989,5 +3027,37 @@ mod tests {
             values.get("name"),
             Some(&SnapshotValue::String("AliceUpdated".to_string()))
         );
+    }
+
+    #[test]
+    fn builds_clickhouse_cdc_latest_state_query() {
+        let schema = TableSchema {
+            table_name: "users".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    postgres_type: "integer".to_string(),
+                    is_nullable: false,
+                    is_primary_key: true,
+                },
+                Column {
+                    name: "name".to_string(),
+                    postgres_type: "text".to_string(),
+                    is_nullable: false,
+                    is_primary_key: false,
+                },
+            ],
+        };
+
+        let query = build_clickhouse_cdc_latest_state_query(&schema, "users_cdc");
+
+        assert!(query.contains("SELECT"));
+        assert!(query.contains("latest.`id` AS `id`"));
+        assert!(query.contains("latest.`name` AS `name`"));
+        assert!(query.contains("PARTITION BY `id`"));
+        assert!(query.contains("ORDER BY _source_lsn DESC"));
+        assert!(query.contains("FROM `users_cdc`"));
+        assert!(query.contains("WHERE row_number = 1"));
+        assert!(query.contains("AND _replication_deleted = 0"));
     }
 }
