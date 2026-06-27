@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+use std::{collections::HashMap, path::PathBuf};
 use tokio_postgres::{Client, Error};
 
 #[derive(Debug, PartialEq)]
@@ -267,6 +267,13 @@ pub struct CdcStageBatch {
 pub struct ParsedPostgresLsn {
     pub high: u64,
     pub low: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReplicationProgress {
+    pub slot_name: String,
+    pub last_staged_lsn: Option<String>,
+    pub last_delivered_lsn: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1689,6 +1696,46 @@ pub async fn create_clickhouse_snapshot_table(
     execute_clickhouse_query(config, &query).await?;
 
     Ok(())
+}
+
+pub fn create_replication_progress_path(stage_dir: &Path, slot_name: &str) -> PathBuf {
+    stage_dir.join(format!("{}_progress.json", slot_name))
+}
+
+pub fn save_replication_progress(
+    path: &Path,
+    progress: &ReplicationProgress,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(progress)?;
+    fs::write(path, json)?;
+
+    Ok(())
+}
+
+pub fn load_replication_progress(path: &Path) -> anyhow::Result<Option<ReplicationProgress>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let json = fs::read_to_string(path)?;
+    let progress = serde_json::from_str(&json)?;
+
+    Ok(Some(progress))
+}
+
+pub fn load_or_create_replication_progress(
+    path: &Path,
+    slot_name: &str,
+) -> anyhow::Result<ReplicationProgress> {
+    if let Some(progress) = load_replication_progress(path)? {
+        return Ok(progress);
+    }
+
+    Ok(ReplicationProgress {
+        slot_name: slot_name.to_string(),
+        last_staged_lsn: None,
+        last_delivered_lsn: None,
+    })
 }
 
 #[cfg(test)]
@@ -3150,5 +3197,81 @@ mod tests {
             compare_postgres_lsn("0/FFFFFFFF", "1/00000000").expect("expected comparison"),
             std::cmp::Ordering::Less
         );
+    }
+
+    #[test]
+    fn creates_replication_progress_path() {
+        let path = create_replication_progress_path(Path::new("/tmp/cdc_stage"), "test_slot");
+
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/cdc_stage/test_slot_progress.json")
+        );
+    }
+
+    fn unique_test_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_millis()
+    }
+
+    #[test]
+    fn saves_and_loads_replication_progress() -> anyhow::Result<()> {
+        let stage_dir = std::env::temp_dir().join(format!(
+            "replication_progress_test_{}",
+            unique_test_suffix()
+        ));
+
+        fs::create_dir_all(&stage_dir)?;
+
+        let path = create_replication_progress_path(&stage_dir, "test_slot");
+
+        let progress = ReplicationProgress {
+            slot_name: "test_slot".to_string(),
+            last_staged_lsn: Some("0/150".to_string()),
+            last_delivered_lsn: Some("0/120".to_string()),
+        };
+
+        save_replication_progress(&path, &progress)?;
+
+        let loaded = load_replication_progress(&path)?.expect("expected progress");
+
+        assert_eq!(loaded, progress);
+
+        if stage_dir.exists() {
+            fs::remove_dir_all(&stage_dir)?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn creates_default_replication_progress_when_missing() -> anyhow::Result<()> {
+        let stage_dir = std::env::temp_dir().join(format!(
+            "replication_progress_missing_test_{}",
+            unique_test_suffix()
+        ));
+
+        fs::create_dir_all(&stage_dir)?;
+
+        let path = create_replication_progress_path(&stage_dir, "test_slot");
+
+        let progress = load_or_create_replication_progress(&path, "test_slot")?;
+
+        assert_eq!(
+            progress,
+            ReplicationProgress {
+                slot_name: "test_slot".to_string(),
+                last_staged_lsn: None,
+                last_delivered_lsn: None,
+            }
+        );
+
+        if stage_dir.exists() {
+            fs::remove_dir_all(&stage_dir)?;
+        }
+
+        Ok(())
     }
 }
