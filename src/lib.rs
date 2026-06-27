@@ -251,6 +251,12 @@ pub struct CdcStageBatch {
     pub events: Vec<CdcEvent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedPostgresLsn {
+    pub high: u64,
+    pub low: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ClickHouseConfig {
     pub url: String,
@@ -548,6 +554,24 @@ pub fn parse_decoded_wal_change(change: DecodedWalChange) -> CdcEvent {
         column_values,
         raw_data: change.data,
     }
+}
+
+pub fn parse_postgres_lsn(lsn: &str) -> anyhow::Result<ParsedPostgresLsn> {
+    let Some((high_part, low_part)) = lsn.split_once('/') else {
+        anyhow::bail!("invalid Postgres LSN format: {}", lsn);
+    };
+
+    let high = u64::from_str_radix(high_part, 16)?;
+    let low = u64::from_str_radix(low_part, 16)?;
+
+    Ok(ParsedPostgresLsn { high, low })
+}
+
+pub fn compare_postgres_lsn(left: &str, right: &str) -> anyhow::Result<std::cmp::Ordering> {
+    let left = parse_postgres_lsn(left)?;
+    let right = parse_postgres_lsn(right)?;
+
+    Ok((left.high, left.low).cmp(&(right.high, right.low)))
 }
 
 pub fn extract_table_name_from_decoded_change(data: &str) -> Option<String> {
@@ -3059,5 +3083,58 @@ mod tests {
         assert!(query.contains("FROM `users_cdc`"));
         assert!(query.contains("WHERE row_number = 1"));
         assert!(query.contains("AND _replication_deleted = 0"));
+    }
+
+    #[test]
+    fn parses_postgres_lsn() {
+        let parsed = parse_postgres_lsn("0/16B6C75").expect("expected valid LSN");
+
+        assert_eq!(
+            parsed,
+            ParsedPostgresLsn {
+                high: 0,
+                low: 0x16B6C75,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_postgres_lsn_with_high_part() {
+        let parsed = parse_postgres_lsn("1/00000000").expect("expected valid LSN");
+
+        assert_eq!(parsed, ParsedPostgresLsn { high: 1, low: 0 });
+    }
+
+    #[test]
+    fn rejects_invalid_postgres_lsn_format() {
+        let result = parse_postgres_lsn("invalid");
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn compares_postgres_lsn_values() {
+        assert_eq!(
+            compare_postgres_lsn("0/100", "0/120").expect("expected comparison"),
+            std::cmp::Ordering::Less
+        );
+
+        assert_eq!(
+            compare_postgres_lsn("0/120", "0/100").expect("expected comparison"),
+            std::cmp::Ordering::Greater
+        );
+
+        assert_eq!(
+            compare_postgres_lsn("0/120", "0/120").expect("expected comparison"),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn compares_postgres_lsn_across_high_part_boundary() {
+        assert_eq!(
+            compare_postgres_lsn("0/FFFFFFFF", "1/00000000").expect("expected comparison"),
+            std::cmp::Ordering::Less
+        );
     }
 }
