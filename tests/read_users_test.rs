@@ -1640,3 +1640,132 @@ async fn latest_state_query_ignores_deleted_rows() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn runs_real_postgres_cdc_changes_into_clickhouse() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+
+    let table_name = unique_table_name();
+    let slot_name = format!("{}_slot", table_name);
+    let clickhouse_table_name = format!("{}_real_cdc", table_name);
+
+    let stage_dir = std::env::temp_dir().join(format!("{}_real_cdc_stage", table_name));
+
+    if stage_dir.exists() {
+        std::fs::remove_dir_all(&stage_dir)?;
+    }
+
+    std::fs::create_dir_all(&stage_dir)?;
+
+    let clickhouse_config = ClickHouseConfig {
+        url: "http://localhost:8123".to_string(),
+        database: "snapshot_demo".to_string(),
+        user: "snapshot_user".to_string(),
+        password: "snapshot_password".to_string(),
+    };
+
+    execute_clickhouse_query(
+        &clickhouse_config,
+        &format!("DROP TABLE IF EXISTS {}", clickhouse_table_name),
+    )
+    .await?;
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_table_sql, &[]).await?;
+
+    let create_slot_sql = format!(
+        "
+        SELECT pg_create_logical_replication_slot('{}', 'test_decoding')
+        ",
+        slot_name
+    );
+
+    client.query_one(&create_slot_sql, &[]).await?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+
+    create_clickhouse_cdc_table(&clickhouse_config, &schema, &clickhouse_table_name).await?;
+
+    client
+        .execute(
+            &format!("INSERT INTO {} (id, name) VALUES (1, 'Alice')", table_name),
+            &[],
+        )
+        .await?;
+
+    client
+        .execute(
+            &format!(
+                "UPDATE {} SET name = 'AliceUpdated' WHERE id = 1",
+                table_name
+            ),
+            &[],
+        )
+        .await?;
+
+    client
+        .execute(&format!("DELETE FROM {} WHERE id = 1", table_name), &[])
+        .await?;
+
+    let metadata = read_decoded_wal_changes_into_stage(&client, &slot_name, 1000, &stage_dir)
+        .await?
+        .expect("expected CDC batch metadata");
+
+    let paths = create_cdc_stage_batch_paths(&stage_dir, &metadata.batch_id);
+
+    let writer = ClickHouseCdcEventWriter {
+        config: clickhouse_config.clone(),
+        table_name: clickhouse_table_name.clone(),
+    };
+
+    deliver_cdc_stage_batch(&paths.metadata_path, &writer).await?;
+
+    let raw_row_count = count_clickhouse_rows(&clickhouse_config, &clickhouse_table_name).await?;
+
+    assert_eq!(raw_row_count, 3);
+
+    let latest_state_query =
+        build_clickhouse_cdc_latest_state_query(&schema, &clickhouse_table_name);
+
+    let latest_row_count = fetch_clickhouse_query(
+        &clickhouse_config,
+        &format!(
+            "
+            SELECT count()
+            FROM ({})
+            ",
+            latest_state_query
+        ),
+    )
+    .await?;
+
+    assert!(latest_row_count.contains("0"));
+
+    execute_clickhouse_query(
+        &clickhouse_config,
+        &format!("DROP TABLE IF EXISTS {}", clickhouse_table_name),
+    )
+    .await?;
+
+    let drop_slot_sql = format!("SELECT pg_drop_replication_slot('{}')", slot_name);
+
+    client.query_one(&drop_slot_sql, &[]).await?;
+
+    let drop_postgres_table_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_postgres_table_sql, &[]).await?;
+
+    if stage_dir.exists() {
+        std::fs::remove_dir_all(&stage_dir)?;
+    }
+
+    Ok(())
+}
