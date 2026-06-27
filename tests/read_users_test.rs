@@ -1483,3 +1483,160 @@ async fn queries_latest_state_from_clickhouse_cdc_table() -> anyhow::Result<()> 
 
     Ok(())
 }
+
+#[tokio::test]
+async fn latest_state_query_ignores_deleted_rows() -> anyhow::Result<()> {
+    let client = connect_to_postgres().await?;
+
+    let table_name = unique_table_name();
+    let clickhouse_table_name = format!("{}_cdc_latest_delete", table_name);
+
+    let stage_dir = std::env::temp_dir().join(format!("{}_cdc_latest_delete_stage", table_name));
+
+    if stage_dir.exists() {
+        std::fs::remove_dir_all(&stage_dir)?;
+    }
+
+    std::fs::create_dir_all(&stage_dir)?;
+
+    let clickhouse_config = ClickHouseConfig {
+        url: "http://localhost:8123".to_string(),
+        database: "snapshot_demo".to_string(),
+        user: "snapshot_user".to_string(),
+        password: "snapshot_password".to_string(),
+    };
+
+    execute_clickhouse_query(
+        &clickhouse_config,
+        &format!("DROP TABLE IF EXISTS {}", clickhouse_table_name),
+    )
+    .await?;
+
+    let create_table_sql = format!(
+        "
+        CREATE TABLE {} (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        )
+        ",
+        table_name
+    );
+
+    client.execute(&create_table_sql, &[]).await?;
+
+    let schema = discover_table_schema(&client, &table_name).await?;
+
+    create_clickhouse_cdc_table(&clickhouse_config, &schema, &clickhouse_table_name).await?;
+
+    let events = vec![
+        CdcEvent {
+            lsn: "0/100".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Begin,
+            table_name: None,
+            column_values: std::collections::HashMap::new(),
+            raw_data: "BEGIN 1".to_string(),
+        },
+        CdcEvent {
+            lsn: "0/120".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Insert,
+            table_name: Some(format!("public.{}", table_name)),
+            column_values: std::collections::HashMap::from([
+                ("id".to_string(), SnapshotValue::String("1".to_string())),
+                (
+                    "name".to_string(),
+                    SnapshotValue::String("Alice".to_string()),
+                ),
+            ]),
+            raw_data: format!(
+                "table public.{}: INSERT: id[integer]:1 name[text]:'Alice'",
+                table_name
+            ),
+        },
+        CdcEvent {
+            lsn: "0/180".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Update,
+            table_name: Some(format!("public.{}", table_name)),
+            column_values: std::collections::HashMap::from([
+                ("id".to_string(), SnapshotValue::String("1".to_string())),
+                (
+                    "name".to_string(),
+                    SnapshotValue::String("AliceUpdated".to_string()),
+                ),
+            ]),
+            raw_data: format!(
+                "table public.{}: UPDATE: id[integer]:1 name[text]:'AliceUpdated'",
+                table_name
+            ),
+        },
+        CdcEvent {
+            lsn: "0/220".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Delete,
+            table_name: Some(format!("public.{}", table_name)),
+            column_values: std::collections::HashMap::from([(
+                "id".to_string(),
+                SnapshotValue::String("1".to_string()),
+            )]),
+            raw_data: format!("table public.{}: DELETE: id[integer]:1", table_name),
+        },
+        CdcEvent {
+            lsn: "0/240".to_string(),
+            xid: "1".to_string(),
+            kind: CdcEventKind::Commit,
+            table_name: None,
+            column_values: std::collections::HashMap::new(),
+            raw_data: "COMMIT 1".to_string(),
+        },
+    ];
+
+    let metadata =
+        write_cdc_stage_batch(&stage_dir, "test_slot", &events)?.expect("expected metadata");
+
+    let paths = create_cdc_stage_batch_paths(&stage_dir, &metadata.batch_id);
+
+    let writer = ClickHouseCdcEventWriter {
+        config: clickhouse_config.clone(),
+        table_name: clickhouse_table_name.clone(),
+    };
+
+    deliver_cdc_stage_batch(&paths.metadata_path, &writer).await?;
+
+    let raw_row_count = count_clickhouse_rows(&clickhouse_config, &clickhouse_table_name).await?;
+
+    assert_eq!(raw_row_count, 3);
+
+    let latest_state_query =
+        build_clickhouse_cdc_latest_state_query(&schema, &clickhouse_table_name);
+
+    let latest_row_count = fetch_clickhouse_query(
+        &clickhouse_config,
+        &format!(
+            "
+            SELECT count()
+            FROM ({})
+            ",
+            latest_state_query
+        ),
+    )
+    .await?;
+
+    assert!(latest_row_count.contains("0"));
+
+    execute_clickhouse_query(
+        &clickhouse_config,
+        &format!("DROP TABLE IF EXISTS {}", clickhouse_table_name),
+    )
+    .await?;
+
+    let drop_postgres_table_sql = format!("DROP TABLE {}", table_name);
+    client.execute(&drop_postgres_table_sql, &[]).await?;
+
+    if stage_dir.exists() {
+        std::fs::remove_dir_all(&stage_dir)?;
+    }
+
+    Ok(())
+}
