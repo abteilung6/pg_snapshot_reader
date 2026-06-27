@@ -1111,7 +1111,7 @@ pub fn build_clickhouse_cdc_latest_state_query(schema: &TableSchema, cdc_table: 
                 *,
                 row_number() OVER (
                     PARTITION BY {}
-                    ORDER BY _source_lsn DESC
+                    ORDER BY _source_lsn_high DESC, _source_lsn_low DESC
                 ) AS row_number
             FROM {}
         ) AS latest
@@ -3093,7 +3093,7 @@ mod tests {
         assert!(query.contains("latest.`id` AS `id`"));
         assert!(query.contains("latest.`name` AS `name`"));
         assert!(query.contains("PARTITION BY `id`"));
-        assert!(query.contains("ORDER BY _source_lsn DESC"));
+        assert!(query.contains("ORDER BY _source_lsn_high DESC, _source_lsn_low DESC"));
         assert!(query.contains("FROM `users_cdc`"));
         assert!(query.contains("WHERE row_number = 1"));
         assert!(query.contains("AND _replication_deleted = 0"));
