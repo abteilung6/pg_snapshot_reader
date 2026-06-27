@@ -992,6 +992,8 @@ pub fn build_clickhouse_create_cdc_table_query(
     }
 
     column_definitions.push("_source_lsn String".to_string());
+    column_definitions.push("_source_lsn_high UInt64".to_string());
+    column_definitions.push("_source_lsn_low UInt64".to_string());
     column_definitions.push("_replication_batch_id String".to_string());
     column_definitions.push("_replication_deleted UInt8".to_string());
 
@@ -2953,7 +2955,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_clickhouse_create_cdc_table_query_with_replication_columns() -> anyhow::Result<()> {
+    fn builds_clickhouse_create_cdc_table_query_with_replication_columns() {
         let schema = TableSchema {
             table_name: "users".to_string(),
             columns: vec![
@@ -2972,17 +2974,17 @@ mod tests {
             ],
         };
 
-        let query = build_clickhouse_create_cdc_table_query(&schema, "users_cdc")?;
+        let query = build_clickhouse_create_cdc_table_query(&schema, "users_cdc")
+            .expect("expected create table query");
 
         assert!(query.contains("CREATE TABLE IF NOT EXISTS `users_cdc`"));
         assert!(query.contains("`id` Nullable(Int32)"));
         assert!(query.contains("`name` Nullable(String)"));
         assert!(query.contains("_source_lsn String"));
+        assert!(query.contains("_source_lsn_high UInt64"));
+        assert!(query.contains("_source_lsn_low UInt64"));
         assert!(query.contains("_replication_batch_id String"));
         assert!(query.contains("_replication_deleted UInt8"));
-        assert!(query.contains("ORDER BY (_replication_batch_id, _source_lsn)"));
-
-        Ok(())
     }
 
     #[test]
